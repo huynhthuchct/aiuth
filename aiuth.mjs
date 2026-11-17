@@ -13,6 +13,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import readline from 'node:readline';
 import { spawnSync } from 'node:child_process';
 
 const HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -211,6 +212,138 @@ function cmdBackups([nameArg]) {
   ids.reverse().forEach((id, i) => console.log(`${i === 0 ? 'latest ' : '       '}${id}`));
 }
 
+/* ───────── export / import: chuyển tài khoản giữa các máy bằng một chuỗi ───────── */
+
+const PREFIX = 'aiuth1';
+
+/** Tách cờ (--no-encrypt, --use, --name x) khỏi tham số vị trí. */
+function parseArgs(args) {
+  const pos = [];
+  const flags = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--name') flags.name = args[++i];
+    else if (a.startsWith('--')) flags[a.slice(2)] = true;
+    else pos.push(a);
+  }
+  return { pos, flags };
+}
+
+/** Hỏi một dòng; hidden=true thì không hiện ký tự (passphrase). */
+function ask(question, hidden = false) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stderr, terminal: true });
+    if (hidden) {
+      rl._writeToOutput = (s) => {
+        if (s.includes(question)) process.stderr.write(s);
+      };
+    }
+    rl.question(question, (ans) => {
+      rl.close();
+      if (hidden) process.stderr.write('\n');
+      resolve(ans);
+    });
+  });
+}
+
+async function getPassphrase(confirm) {
+  if (process.env.AIUTH_PASSPHRASE) return process.env.AIUTH_PASSPHRASE;
+  if (!process.stdin.isTTY) die('Không có TTY: đặt passphrase qua biến môi trường AIUTH_PASSPHRASE.');
+  const p = await ask('Passphrase: ', true);
+  if (!p) die('Passphrase không được để trống.');
+  if (confirm && (await ask('Nhập lại passphrase: ', true)) !== p) die('Passphrase không khớp.');
+  return p;
+}
+
+function encrypt(plain, pass) {
+  const salt = crypto.randomBytes(16);
+  const iv = crypto.randomBytes(12);
+  const key = crypto.scryptSync(pass, salt, 32);
+  const c = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const data = Buffer.concat([c.update(plain, 'utf8'), c.final()]);
+  return Buffer.concat([salt, iv, c.getAuthTag(), data]);
+}
+
+function decrypt(buf, pass) {
+  try {
+    const salt = buf.subarray(0, 16);
+    const iv = buf.subarray(16, 28);
+    const tag = buf.subarray(28, 44);
+    const key = crypto.scryptSync(pass, salt, 32);
+    const d = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    d.setAuthTag(tag);
+    return Buffer.concat([d.update(buf.subarray(44)), d.final()]).toString('utf8');
+  } catch {
+    die('Sai passphrase hoặc chuỗi bị hỏng/cắt cụt.');
+  }
+}
+
+/** export <tên> [id|latest] [--no-encrypt]  → in chuỗi ra stdout (thông báo ra stderr). */
+async function cmdExport(args) {
+  const { pos, flags } = parseArgs(args);
+  const name = checkName(pos[0]);
+  if (!fs.existsSync(accountAuth(name))) die(`Không có tài khoản "${name}".`);
+  const idArg = pos[1] ?? 'main';
+  let raw;
+  if (idArg === 'main') {
+    // Ưu tiên auth live nếu thuộc tài khoản này (token mới nhất).
+    const live = readAuth(AUTH);
+    const saved = readAuth(accountAuth(name));
+    raw = live && identity(live.json).fingerprint === identity(saved.json).fingerprint ? live.raw : saved.raw;
+  } else {
+    const ids = listBackups(name);
+    const id = idArg === 'latest' ? ids.at(-1) : ids.find((x) => x === idArg || x.startsWith(idArg));
+    if (!id) die(`Không tìm thấy backup "${idArg}" của "${name}".`);
+    raw = readAuth(path.join(accountDir(name), 'backups', `${id}.json`)).raw;
+  }
+  const payload = JSON.stringify({ v: 1, name, exportedAt: new Date().toISOString(), auth: raw });
+  let out;
+  if (flags['no-encrypt']) {
+    console.error('⚠ Không mã hoá: chuỗi này chứa token dạng rõ, ai có nó là đăng nhập được.');
+    out = `${PREFIX}:p:${Buffer.from(payload).toString('base64url')}`;
+  } else {
+    out = `${PREFIX}:e:${encrypt(payload, await getPassphrase(true)).toString('base64url')}`;
+  }
+  console.error(`✓ Export "${name}" — dán chuỗi dưới đây vào máy khác: aiuth import <chuỗi>`);
+  console.log(out);
+}
+
+/** import [chuỗi|-] [--name x] [--use]  (không có chuỗi: đọc stdin hoặc hỏi). */
+async function cmdImport(args) {
+  const { pos, flags } = parseArgs(args);
+  let text = pos[0];
+  if (!text || text === '-') {
+    if (process.stdin.isTTY) {
+      text = await ask('Dán chuỗi aiuth1:...: ');
+    } else {
+      const chunks = [];
+      for await (const c of process.stdin) chunks.push(c);
+      text = Buffer.concat(chunks).toString('utf8');
+    }
+  }
+  const m = /^aiuth1:([ep]):([A-Za-z0-9_-]+)$/.exec(text.trim());
+  if (!m) die('Chuỗi không đúng định dạng aiuth1:… (có thể bị cắt khi copy).');
+  const buf = Buffer.from(m[2], 'base64url');
+  const plain = m[1] === 'p' ? buf.toString('utf8') : decrypt(buf, await getPassphrase(false));
+  let payload;
+  try {
+    payload = JSON.parse(plain);
+    JSON.parse(payload.auth);
+  } catch {
+    die('Dữ liệu giải mã không phải auth.json hợp lệ.');
+  }
+  const id = identity(JSON.parse(payload.auth));
+  if (!id.fingerprint) die('auth.json trong chuỗi không có token hay API key.');
+  const name = checkName(flags.name ?? payload.name);
+  const old = readAuth(accountAuth(name));
+  if (old) snapshot(name, old.raw); // giữ bản cũ trước khi ghi đè
+  writeFile(accountAuth(name), payload.auth);
+  snapshot(name, payload.auth);
+  console.log(`✓ Đã import tài khoản "${name}"${id.email ? ` (${id.email})` : ''}${old ? ' (ghi đè bản cũ, đã backup)' : ''}`);
+  if (flags.use) cmdUse([name]);
+  else console.log(`  Dùng ngay: aiuth use ${name}`);
+}
+
 function cmdRestore([nameArg, idArg = 'latest']) {
   const name = checkName(nameArg);
   if (!fs.existsSync(accountAuth(name))) die(`Không có tài khoản "${name}".`);
@@ -294,6 +427,9 @@ const HELP = `aiuth — quản lý nhiều ~/.codex/auth.json
   backup [tên]          Tạo bản backup có dấu thời gian (mặc định: tài khoản đang dùng)
   backups <tên>         Liệt kê backup của tài khoản
   restore <tên> [id]    Khôi phục từ backup (id hoặc tiền tố; mặc định latest)
+  export <tên> [id]     In ra 1 chuỗi (mã hoá bằng passphrase) để import ở máy khác
+                        (--no-encrypt: không mã hoá; AIUTH_PASSPHRASE: passphrase qua env)
+  import [chuỗi]        Nhập chuỗi từ export (--name <tên> đổi tên, --use dùng ngay)
   remove <tên>          Xoá tài khoản đã lưu và backup của nó
 
 Env: CODEX_HOME (mặc định ~/.codex)   Giữ tối đa ${MAX_BACKUPS} backup mỗi tài khoản.`;
@@ -308,6 +444,8 @@ const COMMANDS = {
   switch: cmdUse,
   backup: cmdBackup,
   backups: cmdBackups,
+  export: cmdExport,
+  import: cmdImport,
   restore: cmdRestore,
   remove: cmdRemove,
   rm: cmdRemove,
@@ -317,7 +455,7 @@ const [cmd, ...rest] = process.argv.slice(2);
 if (!cmd || cmd === '-h' || cmd === '--help' || cmd === 'help') {
   console.log(HELP);
 } else if (COMMANDS[cmd]) {
-  COMMANDS[cmd](rest);
+  await COMMANDS[cmd](rest);
 } else {
   die(`Lệnh không hợp lệ: ${cmd}\n\n${HELP}`);
 }
