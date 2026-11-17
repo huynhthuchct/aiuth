@@ -246,14 +246,6 @@ async function cmdUse(args) {
   console.log(`Đang dùng "${name}"${identity(target.json).email ? ` (${identity(target.json).email})` : ''}`);
 }
 
-function cmdBackups([nameArg]) {
-  const name = checkName(nameArg);
-  if (!fs.existsSync(accountAuth(name))) die(`Không có tài khoản "${name}".`);
-  const ids = listBackups(name);
-  if (!ids.length) return console.log('(chưa có backup)');
-  ids.reverse().forEach((id, i) => console.log(`${i === 0 ? 'latest ' : '       '}${id}`));
-}
-
 /* ───────── helper dùng chung cho send / receive ───────── */
 
 /** Tách cờ (--no-encrypt, --use, --name x) khỏi tham số vị trí. */
@@ -621,8 +613,7 @@ const HELP = `aiuth — quản lý nhiều ~/.codex/auth.json
   usage [tên] [--json]  Thống kê limit (% đã dùng, thời gian reset) của từng tài khoản
   use <tên>             Chuyển tài khoản: dừng codex + MCP con của nó, giữ auth hiện tại rồi ghi đè
                         (--no-kill: không dừng codex; áp dụng cho use/add/receive --use)
-  backups <tên>         Liệt kê backup của tài khoản
-  send <tên> [id]       Chờ 1 máy khác trong LAN nhận trực tiếp (in ra lệnh + mã 8 ký tự)
+  send <tên>            Chờ 1 máy khác trong LAN nhận trực tiếp (in ra lệnh + mã 8 ký tự)
   receive <ip:port> <mã>  Nhận tài khoản từ máy đang chạy send (--name, --use)
   remove <tên>          Xoá tài khoản đã lưu và backup của nó
 
@@ -637,7 +628,6 @@ const COMMANDS = {
   ls: cmdList,
   current: cmdCurrent,
   use: cmdUse,
-  backups: cmdBackups,
   send: cmdSend,
   receive: cmdReceive,
   remove: cmdRemove,

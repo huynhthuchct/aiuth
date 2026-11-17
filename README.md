@@ -17,7 +17,7 @@ npm i -g aiuth
 | `aiuth current` | Tài khoản đang dùng |
 | `aiuth usage [tên]` | Thống kê limit từng tài khoản: % đã dùng, thời gian reset, credits (`--json`) |
 | `aiuth use <tên>` | Chuyển tài khoản (tự giữ auth hiện tại trước khi ghi đè) |
-| `aiuth send <tên> [id]` | Chờ 1 máy trong LAN nhận trực tiếp, in lệnh `receive` kèm mã 8 ký tự |
+| `aiuth send <tên>` | Chờ 1 máy trong LAN nhận trực tiếp, in lệnh `receive` kèm mã 8 ký tự |
 | `aiuth receive <ip:port> <mã>` | Nhận tài khoản từ máy đang `send` (`--name`, `--use`) |
 | `aiuth remove <tên>` | Xoá tài khoản đã lưu và backup của nó |
 
