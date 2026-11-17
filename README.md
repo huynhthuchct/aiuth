@@ -13,14 +13,10 @@ npm i -g aiuth
 |---|---|
 | `aiuth add [tên]` | Thêm tài khoản mới bằng `codex login --device-auth`, **không logout** tài khoản cũ |
 | `aiuth save [tên]` | Lưu auth hiện tại thành tài khoản (mặc định tên = email) |
-| `aiuth list` | Liệt kê tài khoản, `*` = đang dùng |
+| `aiuth list [--usage]` | Liệt kê tài khoản, `*` = đang dùng |
 | `aiuth current` | Tài khoản đang dùng |
+| `aiuth usage [tên]` | Thống kê limit từng tài khoản: % đã dùng, thời gian reset, credits (`--json`) |
 | `aiuth use <tên>` | Chuyển tài khoản (tự giữ auth hiện tại trước khi ghi đè) |
-| `aiuth backup [tên]` | Backup có dấu thời gian |
-| `aiuth backups <tên>` | Liệt kê backup |
-| `aiuth restore <tên> [id\|latest]` | Khôi phục từ backup |
-| `aiuth export <tên> [id]` | In 1 chuỗi `aiuth1:e:…` (mã hoá bằng passphrase) để dán sang máy khác |
-| `aiuth import [chuỗi]` | Nhập chuỗi từ `export` (`--name`, `--use`) |
 | `aiuth send <tên> [id]` | Chờ 1 máy trong LAN nhận trực tiếp, in lệnh `receive` kèm mã 8 ký tự |
 | `aiuth receive <ip:port> <mã>` | Nhận tài khoản từ máy đang `send` (`--name`, `--use`) |
 | `aiuth remove <tên>` | Xoá tài khoản đã lưu và backup của nó |
@@ -34,7 +30,7 @@ aiuth send <tên>                      # in: aiuth receive 192.168.1.5:7421 K7P4
 aiuth receive 192.168.1.5:7421 K7P4-QX9M --use
 ```
 
-`send` chỉ phục vụ đúng 1 lần, tự đóng sau 5 phút hoặc sau 3 lần sai mã. Dữ liệu mã hoá bằng mã đó, mã không đi qua mạng. Khác mạng thì dùng `export` / `import`.
+`send` chỉ phục vụ đúng 1 lần, tự đóng sau 5 phút hoặc sau 3 lần sai mã. Dữ liệu mã hoá bằng mã đó, mã không đi qua mạng. Hai máy cần kết nối được với nhau (cùng LAN, hoặc qua Tailscale/VPN).
 
 ## Lưu trữ
 

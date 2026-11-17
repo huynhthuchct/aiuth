@@ -14,7 +14,6 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import readline from 'node:readline';
 import { spawnSync } from 'node:child_process';
 
 const HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -25,7 +24,7 @@ const MAX_BACKUPS = 20;
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._@+-]*$/;
 
 const die = (msg) => {
-  console.error(`✗ ${msg}`);
+  console.error(`Lỗi: ${msg}`);
   process.exit(1);
 };
 
@@ -166,9 +165,9 @@ function ancestorsOf(table, pid) {
  */
 async function stopCodex(flags = {}) {
   if (flags['no-kill']) return;
-  if (process.platform === 'win32') return console.log('• Windows: hãy tự tắt Codex trước khi chuyển tài khoản.');
+  if (process.platform === 'win32') return console.log('Windows: hãy tự tắt Codex trước khi chuyển tài khoản.');
   const ps = spawnSync('ps', ['-axo', 'pid=,ppid=,command='], { encoding: 'utf8' });
-  if (ps.status !== 0) return console.log('• Không đọc được danh sách tiến trình, bỏ qua bước dừng Codex.');
+  if (ps.status !== 0) return console.log('Không đọc được danh sách tiến trình, bỏ qua bước dừng Codex.');
   const table = new Map();
   for (const line of ps.stdout.split('\n')) {
     const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
@@ -189,7 +188,7 @@ async function stopCodex(flags = {}) {
   await new Promise((r) => setTimeout(r, 800));
   const alive = [...doomed].filter((pid) => { try { return process.kill(pid, 0); } catch { return false; } });
   alive.forEach((pid) => { try { process.kill(pid, 'SIGKILL'); } catch {} });
-  console.log(`• Đã dừng ${doomed.size} tiến trình Codex/MCP con (${roots.length} codex)${alive.length ? `, ép tắt ${alive.length}` : ''}.`);
+  console.log(`Đã dừng ${doomed.size} tiến trình Codex/MCP con (${roots.length} codex)${alive.length ? `, ép tắt ${alive.length}` : ''}.`);
 }
 
 function cmdSave([nameArg]) {
@@ -201,24 +200,38 @@ function cmdSave([nameArg]) {
   const existed = fs.existsSync(accountAuth(name));
   writeFile(accountAuth(name), live.raw);
   snapshot(name, live.raw);
-  console.log(`✓ ${existed ? 'Cập nhật' : 'Đã lưu'} tài khoản "${name}"${id.email ? ` (${id.email})` : ''}`);
+  console.log(`${existed ? 'Cập nhật' : 'Đã lưu'} tài khoản "${name}"${id.email ? ` (${id.email})` : ''}`);
 }
 
-function cmdList() {
+async function cmdList(args = []) {
+  const { flags } = parseArgs(args);
   const names = listAccounts();
   if (!names.length) return console.log('Chưa có tài khoản nào. Dùng: aiuth save [tên]');
   const live = readAuth(AUTH);
   const liveFp = live ? identity(live.json).fingerprint : null;
-  console.log(`  ${'TÊN'.padEnd(32)} ${'EMAIL'.padEnd(32)} MODE      BACKUPS`);
-  for (const n of names) {
-    const a = readAuth(accountAuth(n));
-    const id = identity(a.json);
-    const mark = liveFp && id.fingerprint === liveFp ? '*' : ' ';
+  const rows = names.map((n) => {
+    const saved = readAuth(accountAuth(n));
+    const id = identity(saved.json);
+    const active = !!liveFp && id.fingerprint === liveFp;
+    return { n, id, active, raw: active ? live.raw : saved.raw };
+  });
+  // --usage: gọi song song, mỗi tài khoản một dòng tóm tắt limit.
+  const limits = flags.usage ? await Promise.all(rows.map((r) => fetchUsage(r.raw))) : [];
+  const summary = (u) => {
+    if (u.error) return paint(31, `${u.error.split(' — ')[0]}`);
+    const ws = windowsOf(u.data);
+    const txt = ws
+      .map((w) => `${w.label.trim()} ${colorLeft(leftOf(w.used), `còn ${leftOf(w.used)}%`)} (reset ${fmtDur(w.resetIn)})`)
+      .join(' · ');
+    return `${u.data.rate_limit?.limit_reached ? 'CHẠM LIMIT ' : ''}${txt || '-'}`;
+  };
+  console.log(`  ${'TÊN'.padEnd(32)} ${'EMAIL'.padEnd(32)} ${'MODE'.padEnd(9)} ${'BACKUPS'.padEnd(7)}${flags.usage ? ' LIMIT' : ''}`);
+  rows.forEach((r, i) => {
     console.log(
-      `${mark} ${n.padEnd(32)} ${(id.email ?? '-').padEnd(32)} ${id.mode.padEnd(9)} ${listBackups(n).length}`,
+      `${r.active ? '*' : ' '} ${r.n.padEnd(32)} ${(r.id.email ?? '-').padEnd(32)} ${r.id.mode.padEnd(9)} ${String(listBackups(r.n).length).padEnd(7)}${flags.usage ? ` ${summary(limits[i])}` : ''}`,
     );
-  }
-  console.log('\n* = đang dùng (khớp ~/.codex/auth.json)');
+  });
+  console.log(`\n* = đang dùng (khớp ~/.codex/auth.json)${flags.usage ? '' : '   |   thêm --usage để xem limit'}`);
 }
 
 async function cmdUse(args) {
@@ -229,25 +242,8 @@ async function cmdUse(args) {
   await stopCodex(flags);
   const kept = preserveLive();
   writeFile(AUTH, target.raw);
-  if (kept) console.log(`• Đã giữ auth hiện tại vào ${kept}`);
-  console.log(`✓ Đang dùng "${name}"${identity(target.json).email ? ` (${identity(target.json).email})` : ''}`);
-}
-
-function cmdBackup([nameArg]) {
-  let name = nameArg;
-  const live = readAuth(AUTH);
-  if (!name) {
-    if (!live) die('Không có auth live để suy ra tài khoản.');
-    name = findAccountFor(identity(live.json).fingerprint);
-    if (!name) die('Auth hiện tại chưa thuộc tài khoản nào. Dùng: aiuth save [tên]');
-  }
-  checkName(name);
-  if (!fs.existsSync(accountAuth(name))) die(`Không có tài khoản "${name}".`);
-  // Ưu tiên auth live nếu nó thuộc tài khoản này (token mới nhất), nếu không dùng bản đã lưu.
-  const useLive = live && identity(live.json).fingerprint === identity(readAuth(accountAuth(name)).json).fingerprint;
-  const raw = useLive ? live.raw : readAuth(accountAuth(name)).raw;
-  if (useLive) writeFile(accountAuth(name), raw);
-  console.log(`✓ Backup "${name}" → backups/${snapshot(name, raw)}.json`);
+  if (kept) console.log(`Đã giữ auth hiện tại vào ${kept}`);
+  console.log(`Đang dùng "${name}"${identity(target.json).email ? ` (${identity(target.json).email})` : ''}`);
 }
 
 function cmdBackups([nameArg]) {
@@ -258,9 +254,7 @@ function cmdBackups([nameArg]) {
   ids.reverse().forEach((id, i) => console.log(`${i === 0 ? 'latest ' : '       '}${id}`));
 }
 
-/* ───────── export / import: chuyển tài khoản giữa các máy bằng một chuỗi ───────── */
-
-const PREFIX = 'aiuth1';
+/* ───────── helper dùng chung cho send / receive ───────── */
 
 /** Tách cờ (--no-encrypt, --use, --name x) khỏi tham số vị trí. */
 function parseArgs(args) {
@@ -273,32 +267,6 @@ function parseArgs(args) {
     else pos.push(a);
   }
   return { pos, flags };
-}
-
-/** Hỏi một dòng; hidden=true thì không hiện ký tự (passphrase). */
-function ask(question, hidden = false) {
-  return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin, output: process.stderr, terminal: true });
-    if (hidden) {
-      rl._writeToOutput = (s) => {
-        if (s.includes(question)) process.stderr.write(s);
-      };
-    }
-    rl.question(question, (ans) => {
-      rl.close();
-      if (hidden) process.stderr.write('\n');
-      resolve(ans);
-    });
-  });
-}
-
-async function getPassphrase(confirm) {
-  if (process.env.AIUTH_PASSPHRASE) return process.env.AIUTH_PASSPHRASE;
-  if (!process.stdin.isTTY) die('Không có TTY: đặt passphrase qua biến môi trường AIUTH_PASSPHRASE.');
-  const p = await ask('Passphrase: ', true);
-  if (!p) die('Passphrase không được để trống.');
-  if (confirm && (await ask('Nhập lại passphrase: ', true)) !== p) die('Passphrase không khớp.');
-  return p;
 }
 
 function encrypt(plain, pass) {
@@ -337,24 +305,6 @@ function pickRaw(name, idArg = 'main') {
   return readAuth(path.join(accountDir(name), 'backups', `${id}.json`)).raw;
 }
 
-/** export <tên> [id|latest] [--no-encrypt]  → in chuỗi ra stdout (thông báo ra stderr). */
-async function cmdExport(args) {
-  const { pos, flags } = parseArgs(args);
-  const name = checkName(pos[0]);
-  if (!fs.existsSync(accountAuth(name))) die(`Không có tài khoản "${name}".`);
-  const raw = pickRaw(name, pos[1]);
-  const payload = JSON.stringify({ v: 1, name, exportedAt: new Date().toISOString(), auth: raw });
-  let out;
-  if (flags['no-encrypt']) {
-    console.error('⚠ Không mã hoá: chuỗi này chứa token dạng rõ, ai có nó là đăng nhập được.');
-    out = `${PREFIX}:p:${Buffer.from(payload).toString('base64url')}`;
-  } else {
-    out = `${PREFIX}:e:${encrypt(payload, await getPassphrase(true)).toString('base64url')}`;
-  }
-  console.error(`✓ Export "${name}" — dán chuỗi dưới đây vào máy khác: aiuth import <chuỗi>`);
-  console.log(out);
-}
-
 /** Kiểm tra payload giải mã được, lưu thành tài khoản (backup bản cũ nếu ghi đè). */
 async function saveImported(plain, flags) {
   let payload;
@@ -371,29 +321,9 @@ async function saveImported(plain, flags) {
   if (old) snapshot(name, old.raw); // giữ bản cũ trước khi ghi đè
   writeFile(accountAuth(name), payload.auth);
   snapshot(name, payload.auth);
-  console.log(`✓ Đã import tài khoản "${name}"${id.email ? ` (${id.email})` : ''}${old ? ' (ghi đè bản cũ, đã backup)' : ''}`);
+  console.log(`Đã nhận tài khoản "${name}"${id.email ? ` (${id.email})` : ''}${old ? ' (ghi đè bản cũ, đã backup)' : ''}`);
   if (flags.use) await cmdUse([name, ...(flags['no-kill'] ? ['--no-kill'] : [])]);
   else console.log(`  Dùng ngay: aiuth use ${name}`);
-}
-
-/** import [chuỗi|-] [--name x] [--use]  (không có chuỗi: đọc stdin hoặc hỏi). */
-async function cmdImport(args) {
-  const { pos, flags } = parseArgs(args);
-  let text = pos[0];
-  if (!text || text === '-') {
-    if (process.stdin.isTTY) {
-      text = await ask('Dán chuỗi aiuth1:...: ');
-    } else {
-      const chunks = [];
-      for await (const c of process.stdin) chunks.push(c);
-      text = Buffer.concat(chunks).toString('utf8');
-    }
-  }
-  const m = /^aiuth1:([ep]):([A-Za-z0-9_-]+)$/.exec(text.trim());
-  if (!m) die('Chuỗi không đúng định dạng aiuth1:… (có thể bị cắt khi copy).');
-  const buf = Buffer.from(m[2], 'base64url');
-  const plain = m[1] === 'p' ? buf.toString('utf8') : decrypt(buf, await getPassphrase(false));
-  await saveImported(plain, flags);
 }
 
 /* ───────── send / receive: chuyển trực tiếp qua LAN, 1 lần, không qua bên thứ ba ───────── */
@@ -452,12 +382,12 @@ async function cmdSend(args) {
         const got = Buffer.from(given);
         if (got.length === expected.length && crypto.timingSafeEqual(got, expected)) {
           reply(200, { blob });
-          console.log('✓ Máy kia đã nhận xong. Đóng server.');
+          console.log('Máy kia đã nhận xong. Đóng server.');
           setTimeout(() => server.close(() => process.exit(0)), 100);
         } else {
           reply(403, { error: 'sai mã' });
           if (++bad >= MAX_BAD_PROOFS) {
-            console.error(`✗ Sai mã ${MAX_BAD_PROOFS} lần, đóng server.`);
+            console.error(`Sai mã ${MAX_BAD_PROOFS} lần, đóng server.`);
             setTimeout(() => server.close(() => process.exit(1)), 100);
           }
         }
@@ -485,7 +415,7 @@ async function cmdSend(args) {
     console.log('\nCtrl+C để huỷ.');
   });
   setTimeout(() => {
-    console.error('✗ Hết thời gian chờ, đóng server.');
+    console.error('Hết thời gian chờ, đóng server.');
     process.exit(1);
   }, SEND_TTL_MS).unref();
   await new Promise(() => {}); // giữ tiến trình sống; thoát qua process.exit ở trên
@@ -520,21 +450,104 @@ async function cmdReceive(args) {
   await saveImported(plain, flags);
 }
 
-async function cmdRestore(args) {
+/* ───────── usage: thống kê limit theo từng tài khoản ───────── */
+
+const USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
+
+const fmtDur = (sec) => {
+  if (sec == null) return '-';
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+};
+const fmtWindow = (sec) => (sec % 86400 === 0 ? `${sec / 86400}d` : sec % 3600 === 0 ? `${sec / 3600}h` : `${Math.round(sec / 60)}m`);
+// Màu ANSI: chỉ khi in ra terminal và không đặt NO_COLOR.
+const useColor = () => process.stdout.isTTY && !process.env.NO_COLOR;
+const paint = (code, text) => (useColor() ? `\x1b[${code}m${text}\x1b[0m` : text);
+/** % còn lại: < 10 đỏ, > 50 xanh, còn lại vàng. */
+const colorLeft = (left, text) => paint(left < 10 ? 31 : left > 50 ? 32 : 33, text);
+const leftOf = (used) => Math.max(0, Math.min(100, 100 - used));
+
+/** Gọi endpoint usage của Codex bằng token đã lưu. Không refresh token (tránh xoay vòng làm hỏng máy khác). */
+async function fetchUsage(raw) {
+  const json = JSON.parse(raw);
+  const t = json.tokens;
+  if (!t?.access_token) return { error: 'tài khoản API key: không có thống kê limit' };
+  const headers = { Authorization: `Bearer ${t.access_token}`, 'User-Agent': 'aiuth' };
+  if (t.account_id) headers['ChatGPT-Account-Id'] = t.account_id;
+  try {
+    const r = await fetch(USAGE_URL, { headers, signal: AbortSignal.timeout(15_000) });
+    if (r.status === 401 || r.status === 403) {
+      return { error: 'token hết hạn — dùng tài khoản này bằng codex một lần để làm mới, rồi chạy lại' };
+    }
+    if (!r.ok) return { error: `HTTP ${r.status}` };
+    return { data: await r.json() };
+  } catch (e) {
+    return { error: `không kết nối được (${e.cause?.code ?? e.message})` };
+  }
+}
+
+/** Gom các cửa sổ limit (primary/secondary/code review/additional) thành danh sách phẳng. */
+function windowsOf(d) {
+  const out = [];
+  const add = (label, rl) => {
+    for (const key of ['primary_window', 'secondary_window']) {
+      const w = rl?.[key];
+      if (w) out.push({ label: `${label}${fmtWindow(w.limit_window_seconds)}`, used: w.used_percent, resetIn: w.reset_after_seconds, resetAt: w.reset_at });
+    }
+  };
+  add('', d.rate_limit);
+  add('review ', d.code_review_rate_limit);
+  const extra = d.additional_rate_limits;
+  if (Array.isArray(extra)) extra.forEach((e, i) => add(`${e.limit_name ?? e.name ?? `extra${i + 1}`} `, e.rate_limit ?? e));
+  return out;
+}
+
+/** usage [tên] [--json]: limit hiện tại của từng tài khoản đã lưu (không cần switch). */
+async function cmdUsage(args) {
   const { pos, flags } = parseArgs(args);
-  const name = checkName(pos[0]);
-  const idArg = pos[1] ?? 'latest';
-  if (!fs.existsSync(accountAuth(name))) die(`Không có tài khoản "${name}".`);
-  const ids = listBackups(name);
-  const id = idArg === 'latest' ? ids.at(-1) : ids.find((x) => x === idArg || x.startsWith(idArg));
-  if (!id) die(`Không tìm thấy backup "${idArg}" của "${name}". Xem: aiuth backups ${name}`);
-  const bk = readAuth(path.join(accountDir(name), 'backups', `${id}.json`));
-  await stopCodex(flags);
-  const kept = preserveLive();
-  writeFile(accountAuth(name), bk.raw);
-  writeFile(AUTH, bk.raw);
-  if (kept) console.log(`• Đã giữ auth hiện tại vào ${kept}`);
-  console.log(`✓ Khôi phục "${name}" từ backup ${id} → ${AUTH}`);
+  const names = pos[0] ? [checkName(pos[0])] : listAccounts();
+  if (!names.length) return console.log('Chưa có tài khoản nào. Dùng: aiuth save [tên]');
+  for (const n of names) if (!fs.existsSync(accountAuth(n))) die(`Không có tài khoản "${n}".`);
+  const live = readAuth(AUTH);
+  const liveFp = live ? identity(live.json).fingerprint : null;
+
+  const results = await Promise.all(
+    names.map(async (n) => {
+      const saved = readAuth(accountAuth(n));
+      // Auth live của cùng tài khoản thường mới hơn bản đã lưu (Codex tự refresh token).
+      const useLive = live && identity(saved.json).fingerprint === liveFp;
+      const res = await fetchUsage(useLive ? live.raw : saved.raw);
+      return { name: n, active: useLive, email: identity(saved.json).email, ...res };
+    }),
+  );
+
+  if (flags.json) {
+    console.log(JSON.stringify(results.map((r) => ({ name: r.name, active: r.active, email: r.email, usage: r.data ?? null, error: r.error ?? null })), null, 2));
+    return;
+  }
+
+  for (const r of results) {
+    const head = `${r.active ? '*' : ' '} ${r.name}${r.email && r.email !== r.name ? `  (${r.email})` : ''}`;
+    if (r.error) {
+      console.log(`${head}\n    ${r.error}\n`);
+      continue;
+    }
+    const d = r.data;
+    const status = d.rate_limit?.limit_reached ? '  ĐÃ CHẠM LIMIT' : '';
+    console.log(`${head}  [${d.plan_type ?? '?'}]${status}`);
+    const ws = windowsOf(d);
+    if (!ws.length) console.log('    (không có thông tin cửa sổ limit)');
+    for (const w of ws) {
+      const left = leftOf(w.used);
+      console.log(`    ${w.label.padEnd(10)} ${colorLeft(left, `còn ${String(left).padStart(3)}%`)} · reset sau ${fmtDur(w.resetIn)}`);
+    }
+    if (d.credits?.has_credits) console.log(`    credits    ${d.credits.unlimited ? 'không giới hạn' : d.credits.balance}`);
+    if (d.rate_limit_reached_type) console.log(`    chạm limit loại: ${d.rate_limit_reached_type}`);
+    console.log('');
+  }
+  console.log('* = đang dùng. Số liệu lấy trực tiếp từ OpenAI bằng token đã lưu của từng tài khoản.');
 }
 
 /**
@@ -559,10 +572,10 @@ async function cmdAdd(args) {
       if (!keep) die('Auth hiện tại chưa được lưu và không có email. Chạy "save <tên>" trước đã.');
       writeFile(accountAuth(keep), old.raw);
       snapshot(keep, old.raw);
-      console.log(`• Đã lưu auth hiện tại thành "${keep}"`);
+      console.log(`Đã lưu auth hiện tại thành "${keep}"`);
     }
     fs.rmSync(AUTH); // chỉ xoá file cục bộ, không gọi logout
-    console.log('• Đã gỡ auth.json cục bộ (không logout, token cũ vẫn sống).');
+    console.log('Đã gỡ auth.json cục bộ (không logout, token cũ vẫn sống).');
   }
 
   const r = spawnSync('codex', ['login', '--device-auth'], { stdio: 'inherit' });
@@ -581,14 +594,14 @@ async function cmdAdd(args) {
   const name = checkName(nameArg ?? id.email);
   writeFile(accountAuth(name), fresh.raw);
   snapshot(name, fresh.raw);
-  console.log(`✓ Đã thêm tài khoản "${name}"${id.email ? ` (${id.email})` : ''} và đang dùng nó.`);
+  console.log(`Đã thêm tài khoản "${name}"${id.email ? ` (${id.email})` : ''} và đang dùng nó.`);
 }
 
 function cmdRemove([nameArg]) {
   const name = checkName(nameArg);
   if (!fs.existsSync(accountDir(name))) die(`Không có tài khoản "${name}".`);
   fs.rmSync(accountDir(name), { recursive: true });
-  console.log(`✓ Đã xoá tài khoản "${name}" cùng các backup của nó (auth.json live không bị đụng).`);
+  console.log(`Đã xoá tài khoản "${name}" cùng các backup của nó (auth.json live không bị đụng).`);
 }
 
 function cmdCurrent() {
@@ -603,16 +616,12 @@ const HELP = `aiuth — quản lý nhiều ~/.codex/auth.json
 
   add [tên]             Thêm tài khoản mới bằng device code, KHÔNG logout tài khoản cũ
   save [tên]            Lưu auth.json hiện tại thành tài khoản (mặc định tên = email)
-  list                  Liệt kê tài khoản (* = đang dùng)
+  list [--usage]        Liệt kê tài khoản (* = đang dùng); --usage thêm cột limit
   current               Tài khoản đang dùng
+  usage [tên] [--json]  Thống kê limit (% đã dùng, thời gian reset) của từng tài khoản
   use <tên>             Chuyển tài khoản: dừng codex + MCP con của nó, giữ auth hiện tại rồi ghi đè
-                        (--no-kill: không dừng codex; áp dụng cho use/restore/add/import --use)
-  backup [tên]          Tạo bản backup có dấu thời gian (mặc định: tài khoản đang dùng)
+                        (--no-kill: không dừng codex; áp dụng cho use/add/receive --use)
   backups <tên>         Liệt kê backup của tài khoản
-  restore <tên> [id]    Khôi phục từ backup (id hoặc tiền tố; mặc định latest)
-  export <tên> [id]     In ra 1 chuỗi (mã hoá bằng passphrase) để import ở máy khác
-                        (--no-encrypt: không mã hoá; AIUTH_PASSPHRASE: passphrase qua env)
-  import [chuỗi]        Nhập chuỗi từ export (--name <tên> đổi tên, --use dùng ngay)
   send <tên> [id]       Chờ 1 máy khác trong LAN nhận trực tiếp (in ra lệnh + mã 8 ký tự)
   receive <ip:port> <mã>  Nhận tài khoản từ máy đang chạy send (--name, --use)
   remove <tên>          Xoá tài khoản đã lưu và backup của nó
@@ -623,17 +632,14 @@ const COMMANDS = {
   add: cmdAdd,
   save: cmdSave,
   list: cmdList,
+  usage: cmdUsage,
+  limits: cmdUsage,
   ls: cmdList,
   current: cmdCurrent,
   use: cmdUse,
-  switch: cmdUse,
-  backup: cmdBackup,
   backups: cmdBackups,
-  export: cmdExport,
-  import: cmdImport,
   send: cmdSend,
   receive: cmdReceive,
-  restore: cmdRestore,
   remove: cmdRemove,
   rm: cmdRemove,
 };
