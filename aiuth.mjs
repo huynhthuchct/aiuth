@@ -14,6 +14,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import readline from 'node:readline';
+import tls from 'node:tls';
 import { spawnSync } from 'node:child_process';
 
 const HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
@@ -83,6 +85,19 @@ const checkName = (name) => {
   if (!NAME_RE.test(name)) die(`Tên "${name}" không hợp lệ (chỉ dùng chữ, số, . _ @ + -).`);
   return name;
 };
+
+/** Nhận tên tài khoản hoặc số thứ tự (theo `aiuth list`). Tên khớp chính xác được ưu tiên. */
+function resolveName(arg) {
+  if (!arg) die('Thiếu tên hoặc số thứ tự tài khoản.');
+  const names = listAccounts();
+  if (names.includes(arg)) return arg;
+  if (/^\d+$/.test(arg)) {
+    const i = Number(arg);
+    if (i >= 1 && i <= names.length) return names[i - 1];
+    die(`Không có tài khoản số ${arg} (hiện có ${names.length}). Xem: aiuth list`);
+  }
+  return checkName(arg);
+}
 
 const accountDir = (name) => path.join(STORE, name);
 const accountAuth = (name) => path.join(accountDir(name), 'auth.json');
@@ -225,18 +240,18 @@ async function cmdList(args = []) {
       .join(' · ');
     return `${u.data.rate_limit?.limit_reached ? 'CHẠM LIMIT ' : ''}${txt || '-'}`;
   };
-  console.log(`  ${'TÊN'.padEnd(32)} ${'EMAIL'.padEnd(32)} ${'MODE'.padEnd(9)} ${'BACKUPS'.padEnd(7)}${flags.usage ? ' LIMIT' : ''}`);
+  console.log(`  ${'#'.padStart(2)} ${'TÊN'.padEnd(32)} ${'EMAIL'.padEnd(32)} ${'MODE'.padEnd(9)} ${'BACKUPS'.padEnd(7)}${flags.usage ? ' LIMIT' : ''}`);
   rows.forEach((r, i) => {
     console.log(
-      `${r.active ? '*' : ' '} ${r.n.padEnd(32)} ${(r.id.email ?? '-').padEnd(32)} ${r.id.mode.padEnd(9)} ${String(listBackups(r.n).length).padEnd(7)}${flags.usage ? ` ${summary(limits[i])}` : ''}`,
+      `${r.active ? '*' : ' '} ${String(i + 1).padStart(2)} ${r.n.padEnd(32)} ${(r.id.email ?? '-').padEnd(32)} ${r.id.mode.padEnd(9)} ${String(listBackups(r.n).length).padEnd(7)}${flags.usage ? ` ${summary(limits[i])}` : ''}`,
     );
   });
-  console.log(`\n* = đang dùng (khớp ~/.codex/auth.json)${flags.usage ? '' : '   |   thêm --usage để xem limit'}`);
+  console.log(`\n* = đang dùng (khớp ~/.codex/auth.json)${flags.usage ? '' : '   |   thêm --usage để xem limit   |   dùng: aiuth use <số hoặc tên>'}`);
 }
 
 async function cmdUse(args) {
   const { pos, flags } = parseArgs(args);
-  const name = checkName(pos[0]);
+  const name = resolveName(pos[0]);
   const target = readAuth(accountAuth(name));
   if (!target) die(`Không có tài khoản "${name}". Xem: aiuth list`);
   await stopCodex(flags);
@@ -254,7 +269,7 @@ function parseArgs(args) {
   const flags = {};
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '--name' || a === '--port') flags[a.slice(2)] = args[++i];
+    if (a === '--name' || a === '--port' || a === '--to' || a === '--wait') flags[a.slice(2)] = args[++i];
     else if (a.startsWith('--')) flags[a.slice(2)] = true;
     else pos.push(a);
   }
@@ -324,10 +339,11 @@ const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // bỏ I O 0 1 cho d�
 const SEND_TTL_MS = 5 * 60 * 1000;
 const MAX_BAD_PROOFS = 3;
 
-const newCode = () => {
-  const c = Array.from({ length: 8 }, () => CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)]).join('');
-  return `${c.slice(0, 4)}-${c.slice(4)}`;
-};
+const newCode = (len = 8) =>
+  Array.from({ length: len }, () => CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)])
+    .join('')
+    .match(/.{1,4}/g)
+    .join('-');
 const normCode = (c) => String(c).toUpperCase().replace(/[^A-Z0-9]/g, '');
 const proofOf = (code, salt) =>
   crypto.createHmac('sha256', crypto.scryptSync(normCode(code), salt, 32)).update('aiuth-proof').digest('hex');
@@ -345,8 +361,9 @@ const lanAddresses = () =>
  */
 async function cmdSend(args) {
   const { pos, flags } = parseArgs(args);
-  const name = checkName(pos[0]);
+  const name = resolveName(pos[0]);
   if (!fs.existsSync(accountAuth(name))) die(`Không có tài khoản "${name}".`);
+  if (flags.mail) return sendViaMail(name, pos[1], flags);
   const code = newCode();
   const payload = JSON.stringify({ v: 1, name, exportedAt: new Date().toISOString(), auth: pickRaw(name, pos[1]) });
   const blob = encrypt(payload, normCode(code)).toString('base64url');
@@ -416,6 +433,7 @@ async function cmdSend(args) {
 /** receive <host:port> <mã> [--name x] [--use] */
 async function cmdReceive(args) {
   const { pos, flags } = parseArgs(args);
+  if (flags.mail) return receiveViaMail(pos[0], flags);
   const [addr, codeArg] = pos;
   if (!addr || !codeArg) die('Dùng: aiuth receive <host:port> <mã>   (ví dụ: aiuth receive 192.168.1.5:7421 K7P4-QX9M)');
   if (!/^[A-Za-z0-9.-]+:\d{1,5}$/.test(addr)) die(`Địa chỉ "${addr}" không hợp lệ, cần dạng host:port.`);
@@ -497,14 +515,216 @@ function windowsOf(d) {
 }
 
 /** usage [tên] [--json]: limit hiện tại của từng tài khoản đã lưu (không cần switch). */
+/* ───────── mail: chuyển tài khoản qua hộp thư (SMTP gửi, IMAP nhận), mã hoá đầu-cuối ───────── */
+
+const MAIL_CFG = path.join(HOME, 'aiuth-mail.json');
+const GMAIL_APP_PASSWORD_URL = 'https://myaccount.google.com/apppasswords';
+const MAIL_CODE_LEN = 12; // dài hơn LAN vì blob nằm lâu trong hộp thư
+const MAIL_MAX_AGE_MS = 24 * 3600 * 1000;
+const MAIL_PRESETS = {
+  'gmail.com': { smtp: 'smtp.gmail.com:465', imap: 'imap.gmail.com:993' },
+  'googlemail.com': { smtp: 'smtp.gmail.com:465', imap: 'imap.gmail.com:993' },
+  'yahoo.com': { smtp: 'smtp.mail.yahoo.com:465', imap: 'imap.mail.yahoo.com:993' },
+  'zoho.com': { smtp: 'smtp.zoho.com:465', imap: 'imap.zoho.com:993' },
+};
+
+/** Hỏi một dòng; hidden=true thì không hiện ký tự. */
+function ask(question, hidden = false) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stderr, terminal: true });
+    if (hidden) rl._writeToOutput = (t) => { if (t.includes(question)) process.stderr.write(t); };
+    rl.question(question, (ans) => {
+      rl.close();
+      if (hidden) process.stderr.write('\n');
+      resolve(ans.trim());
+    });
+  });
+}
+
+/** Cấu hình mail: biến môi trường ưu tiên, sau đó file aiuth-mail.json (0600). */
+function mailConfig() {
+  let f = {};
+  try {
+    f = JSON.parse(fs.readFileSync(MAIL_CFG, 'utf8'));
+  } catch {}
+  const user = process.env.AIUTH_MAIL_USER ?? f.user;
+  const pass = process.env.AIUTH_MAIL_PASS ?? f.pass;
+  const preset = MAIL_PRESETS[String(user ?? '').split('@')[1]] ?? {};
+  const smtp = process.env.AIUTH_SMTP ?? f.smtp ?? preset.smtp;
+  const imap = process.env.AIUTH_IMAP ?? f.imap ?? preset.imap;
+  if (!user || !pass || !smtp || !imap) die(`Chưa cấu hình mail. Chạy: aiuth mail setup (Gmail: tạo app password tại ${GMAIL_APP_PASSWORD_URL})`);
+  return { user, pass, smtp, imap };
+}
+
+/** Bộ đọc socket: until(test) gom dữ liệu tới khi test đúng, rồi xả buffer. */
+function reader(sock) {
+  let buf = '';
+  let wake = null;
+  let err = null;
+  sock.setEncoding('utf8');
+  sock.on('data', (d) => { buf += d; wake?.(); });
+  sock.on('error', (e) => { err = e; wake?.(); });
+  sock.on('close', () => { err ??= new Error('kết nối bị đóng'); wake?.(); });
+  return {
+    async until(test) {
+      for (;;) {
+        if (test(buf)) { const out = buf; buf = ''; return out; }
+        if (err) throw err;
+        await new Promise((r) => { wake = r; });
+      }
+    },
+  };
+}
+
+function tlsConnect(hostPort) {
+  const [host, port] = hostPort.split(':');
+  return new Promise((resolve, reject) => {
+    const s = tls.connect({ host, port: Number(port), servername: host }, () => resolve(s));
+    s.setTimeout(30_000, () => s.destroy(new Error('hết thời gian chờ')));
+    s.once('error', reject);
+  });
+}
+
+async function smtpSend(cfg, to, subject, body) {
+  const s = await tlsConnect(cfg.smtp);
+  const rd = reader(s);
+  const lastLine = (b) => /(^|\r\n)\d{3} [^\r\n]*\r\n$/.test(b);
+  const expect = async (okRe, what) => {
+    const r = await rd.until(lastLine);
+    if (!okRe.test(r)) throw new Error(`SMTP ${what}: ${r.trim().split('\r\n').pop()}`);
+  };
+  try {
+    await expect(/^220/, 'chào');
+    s.write('EHLO aiuth\r\n'); await expect(/^250/, 'EHLO');
+    s.write(`AUTH PLAIN ${Buffer.from(`\0${cfg.user}\0${cfg.pass}`).toString('base64')}\r\n`); await expect(/^235/, 'đăng nhập');
+    s.write(`MAIL FROM:<${cfg.user}>\r\n`); await expect(/^250/, 'MAIL FROM');
+    s.write(`RCPT TO:<${to}>\r\n`); await expect(/^25[01]/, 'RCPT TO');
+    s.write('DATA\r\n'); await expect(/^354/, 'DATA');
+    const msg = [
+      `From: ${cfg.user}`, `To: ${to}`, `Subject: ${subject}`, `Date: ${new Date().toUTCString()}`,
+      `Message-ID: <${crypto.randomUUID()}@aiuth>`, 'MIME-Version: 1.0',
+      'Content-Type: text/plain; charset=us-ascii', 'Content-Transfer-Encoding: 7bit', '', body,
+    ].join('\r\n');
+    s.write(`${msg.replace(/^\./gm, '..')}\r\n.\r\n`); await expect(/^250/, 'gửi thư');
+    s.write('QUIT\r\n');
+  } finally {
+    s.end();
+  }
+}
+
+/** Tìm thư theo subject, lấy phần thân, đánh dấu xoá. Trả về chuỗi blob hoặc null. */
+async function imapTake(cfg, subject) {
+  const s = await tlsConnect(cfg.imap);
+  const rd = reader(s);
+  let n = 0;
+  const run = async (cmd) => {
+    const tag = `a${++n}`;
+    s.write(`${tag} ${cmd}\r\n`);
+    const out = await rd.until((b) => new RegExp(`(^|\\r\\n)${tag} (OK|NO|BAD)[^\\r\\n]*\\r\\n$`).test(b));
+    if (!new RegExp(`(^|\\r\\n)${tag} OK`).test(out)) throw new Error(`IMAP ${cmd.split(' ')[0]}: ${out.trim().split('\r\n').pop()}`);
+    return out;
+  };
+  const q = (v) => `"${String(v).replace(/(["\\])/g, '\\$1')}"`;
+  try {
+    await rd.until((b) => /\r\n$/.test(b)); // lời chào
+    await run(`LOGIN ${q(cfg.user)} ${q(cfg.pass)}`);
+    await run('SELECT INBOX');
+    const found = /\* SEARCH([\d ]*)\r\n/.exec(await run(`SEARCH SUBJECT ${q(subject)}`));
+    const ids = (found?.[1] ?? '').trim().split(/\s+/).filter(Boolean);
+    if (!ids.length) return null;
+    const id = ids.at(-1);
+    const body = await run(`FETCH ${id} BODY.PEEK[TEXT]`);
+    const m = /-----BEGIN AIUTH-----([\s\S]*?)-----END AIUTH-----/.exec(body);
+    if (!m) throw new Error('Thư tìm thấy nhưng không có dữ liệu aiuth.');
+    await run(`STORE ${ids.join(',')} +FLAGS (\\Deleted)`);
+    await run('EXPUNGE');
+    return m[1].replace(/\s+/g, '');
+  } finally {
+    s.write(`a${++n} LOGOUT\r\n`);
+    s.end();
+  }
+}
+
+const mailId = (code) => crypto.scryptSync(normCode(code), 'aiuth-mail-id-v1', 12).toString('hex');
+
+/** send <tên> --mail [--to địa-chỉ]: gửi blob mã hoá vào hộp thư, in mã để nhập ở máy kia. */
+async function sendViaMail(name, idArg, flags) {
+  const cfg = mailConfig();
+  const to = flags.to ?? cfg.user;
+  const code = newCode(MAIL_CODE_LEN);
+  const payload = JSON.stringify({ v: 1, name, exportedAt: new Date().toISOString(), auth: pickRaw(name, idArg) });
+  const blob = encrypt(payload, normCode(code)).toString('base64url');
+  const wrapped = blob.match(/.{1,72}/g).join('\r\n');
+  const body = `Thu tu dong tu aiuth. Khong tra loi. Du lieu da ma hoa, can ma de mo.\r\n\r\n-----BEGIN AIUTH-----\r\n${wrapped}\r\n-----END AIUTH-----`;
+  try {
+    await smtpSend(cfg, to, `aiuth:${mailId(code)}`, body);
+  } catch (e) {
+    die(`Gửi mail thất bại. ${e.message}`);
+  }
+  console.log(`Đã gửi tới ${to}.\n`);
+  console.log('Trên máy kia chạy:');
+  console.log(`  aiuth receive --mail ${code}\n`);
+  console.log('Mã này chỉ hiện một lần và không nằm trong thư. Thư sẽ bị xoá khỏi INBOX sau khi nhận.');
+}
+
+/** receive --mail <mã> [--wait giây] [--name x] [--use]: lấy thư, giải mã, lưu tài khoản. */
+async function receiveViaMail(codeArg, flags) {
+  if (!codeArg) die('Dùng: aiuth receive --mail <mã>');
+  const cfg = mailConfig();
+  const subject = `aiuth:${mailId(codeArg)}`;
+  const deadline = Date.now() + (Number(flags.wait ?? 60) || 60) * 1000;
+  let blob = null;
+  for (;;) {
+    try {
+      blob = await imapTake(cfg, subject);
+    } catch (e) {
+      die(`Đọc mail thất bại. ${e.message}`);
+    }
+    if (blob || Date.now() >= deadline) break;
+    console.log('Chưa thấy thư, thử lại sau 5 giây...');
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+  if (!blob) die('Không thấy thư. Kiểm tra mã, hoặc tăng --wait <giây>.');
+  const plain = decrypt(Buffer.from(blob, 'base64url'), normCode(codeArg));
+  const age = Date.now() - Date.parse(JSON.parse(plain).exportedAt);
+  if (age > MAIL_MAX_AGE_MS) die('Thư đã quá 24 giờ, từ chối nhận. Hãy gửi lại.');
+  await saveImported(plain, flags);
+}
+
+/** mail setup: lưu tài khoản mail (mật khẩu ứng dụng) vào aiuth-mail.json, quyền 0600. */
+async function cmdMail([sub]) {
+  if (sub !== 'setup') die('Dùng: aiuth mail setup');
+  if (!process.stdin.isTTY) die('Cần chạy trong terminal tương tác, hoặc đặt AIUTH_MAIL_USER / AIUTH_MAIL_PASS.');
+  console.error('Dùng Gmail? Tạo mật khẩu ứng dụng (cần bật xác minh 2 bước) tại:');
+  console.error(`  ${GMAIL_APP_PASSWORD_URL}\n`);
+  const user = await ask('Địa chỉ email: ');
+  const domain = user.split('@')[1];
+  const preset = MAIL_PRESETS[domain] ?? {};
+  const smtp = (await ask(`SMTP host:port [${preset.smtp ?? 'bắt buộc'}]: `)) || preset.smtp;
+  const imap = (await ask(`IMAP host:port [${preset.imap ?? 'bắt buộc'}]: `)) || preset.imap;
+  const pass = await ask('Mật khẩu ứng dụng (app password, không phải mật khẩu chính): ', true);
+  if (!user || !smtp || !imap || !pass) die('Thiếu thông tin.');
+  const cfg = { user, pass, smtp, imap };
+  try {
+    const s = await tlsConnect(imap);
+    s.destroy();
+    await imapTake(cfg, 'aiuth:selftest'); // thử đăng nhập IMAP
+  } catch (e) {
+    die(`Không đăng nhập được: ${e.message || e.code || e.errors?.[0]?.code || "lỗi kết nối"}. Chưa lưu cấu hình.${domain === 'gmail.com' || domain === 'googlemail.com' ? ` Kiểm tra app password: ${GMAIL_APP_PASSWORD_URL}` : ''}`);
+  }
+  writeFile(MAIL_CFG, `${JSON.stringify(cfg, null, 2)}\n`);
+  console.log(`Đã lưu ${MAIL_CFG} (quyền 0600, mật khẩu ứng dụng lưu dạng rõ giống auth.json).`);
+}
+
 async function cmdUsage(args) {
   const { pos, flags } = parseArgs(args);
-  const names = pos[0] ? [checkName(pos[0])] : listAccounts();
+  const names = pos[0] ? [resolveName(pos[0])] : listAccounts();
   if (!names.length) return console.log('Chưa có tài khoản nào. Dùng: aiuth save [tên]');
   for (const n of names) if (!fs.existsSync(accountAuth(n))) die(`Không có tài khoản "${n}".`);
   const live = readAuth(AUTH);
   const liveFp = live ? identity(live.json).fingerprint : null;
 
+  const all = listAccounts();
   const results = await Promise.all(
     names.map(async (n) => {
       const saved = readAuth(accountAuth(n));
@@ -521,7 +741,7 @@ async function cmdUsage(args) {
   }
 
   for (const r of results) {
-    const head = `${r.active ? '*' : ' '} ${r.name}${r.email && r.email !== r.name ? `  (${r.email})` : ''}`;
+    const head = `${r.active ? '*' : ' '} ${String(all.indexOf(r.name) + 1).padStart(2)}. ${r.name}${r.email && r.email !== r.name ? `  (${r.email})` : ''}`;
     if (r.error) {
       console.log(`${head}\n    ${r.error}\n`);
       continue;
@@ -590,7 +810,7 @@ async function cmdAdd(args) {
 }
 
 function cmdRemove([nameArg]) {
-  const name = checkName(nameArg);
+  const name = resolveName(nameArg);
   if (!fs.existsSync(accountDir(name))) die(`Không có tài khoản "${name}".`);
   fs.rmSync(accountDir(name), { recursive: true });
   console.log(`Đã xoá tài khoản "${name}" cùng các backup của nó (auth.json live không bị đụng).`);
@@ -610,10 +830,13 @@ const HELP = `aiuth — quản lý nhiều ~/.codex/auth.json
   save [tên]            Lưu auth.json hiện tại thành tài khoản (mặc định tên = email)
   list [--usage]        Liệt kê tài khoản (* = đang dùng); --usage thêm cột limit
   current               Tài khoản đang dùng
-  usage [tên] [--json]  Thống kê limit (% đã dùng, thời gian reset) của từng tài khoản
-  use <tên>             Chuyển tài khoản: dừng codex + MCP con của nó, giữ auth hiện tại rồi ghi đè
+  usage [số|tên] [--json]  Thống kê limit (% đã dùng, thời gian reset) của từng tài khoản
+  use <số|tên>          Chuyển tài khoản (số thứ tự theo list): dừng codex + MCP con của nó, giữ auth hiện tại rồi ghi đè
                         (--no-kill: không dừng codex; áp dụng cho use/add/receive --use)
   send <tên>            Chờ 1 máy khác trong LAN nhận trực tiếp (in ra lệnh + mã 8 ký tự)
+  send <tên> --mail     Gửi qua hộp thư (mã hoá), in mã 12 ký tự; --to <địa-chỉ> gửi tới mail khác
+  receive --mail <mã>   Lấy từ hộp thư rồi giải mã (--wait <giây>, --name, --use)
+  mail setup            Lưu tài khoản mail (app password) cho send/receive --mail
   receive <ip:port> <mã>  Nhận tài khoản từ máy đang chạy send (--name, --use)
   remove <tên>          Xoá tài khoản đã lưu và backup của nó
 
@@ -629,6 +852,7 @@ const COMMANDS = {
   current: cmdCurrent,
   use: cmdUse,
   send: cmdSend,
+  mail: cmdMail,
   receive: cmdReceive,
   remove: cmdRemove,
   rm: cmdRemove,
