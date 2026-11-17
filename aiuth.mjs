@@ -149,6 +149,49 @@ function preserveLive() {
 
 /* ───────────────────────────── commands ───────────────────────────── */
 
+/* ───────── dừng Codex đang chạy (giữ token cũ trong RAM, có thể ghi đè auth.json) ───────── */
+
+const CODEX_CMD_RE = /(^|[\s/])codex(-[\w.-]+)?(\s|$)|@openai\/codex/;
+
+/** Tổ tiên của tiến trình hiện tại (để không tự giết shell/terminal đang chạy aiuth). */
+function ancestorsOf(table, pid) {
+  const out = new Set();
+  for (let p = pid; p && table.has(p) && !out.has(p); p = table.get(p).ppid) out.add(p);
+  return out;
+}
+
+/**
+ * Dừng mọi tiến trình codex và cây con của chúng (MCP server do codex mở).
+ * Không dùng `pkill -f mcp`: nó khớp cả MCP server của Claude/IDE và các app khác.
+ */
+async function stopCodex(flags = {}) {
+  if (flags['no-kill']) return;
+  if (process.platform === 'win32') return console.log('• Windows: hãy tự tắt Codex trước khi chuyển tài khoản.');
+  const ps = spawnSync('ps', ['-axo', 'pid=,ppid=,command='], { encoding: 'utf8' });
+  if (ps.status !== 0) return console.log('• Không đọc được danh sách tiến trình, bỏ qua bước dừng Codex.');
+  const table = new Map();
+  for (const line of ps.stdout.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    if (m) table.set(Number(m[1]), { ppid: Number(m[2]), cmd: m[3] });
+  }
+  const skip = ancestorsOf(table, process.pid);
+  const roots = [...table].filter(([pid, v]) => !skip.has(pid) && CODEX_CMD_RE.test(v.cmd)).map(([pid]) => pid);
+  const doomed = new Set(roots);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const [pid, v] of table) {
+      if (!doomed.has(pid) && !skip.has(pid) && doomed.has(v.ppid)) (doomed.add(pid), (grew = true));
+    }
+  }
+  if (!doomed.size) return;
+  const send = (sig) => doomed.forEach((pid) => { try { process.kill(pid, sig); } catch {} });
+  send('SIGTERM');
+  await new Promise((r) => setTimeout(r, 800));
+  const alive = [...doomed].filter((pid) => { try { return process.kill(pid, 0); } catch { return false; } });
+  alive.forEach((pid) => { try { process.kill(pid, 'SIGKILL'); } catch {} });
+  console.log(`• Đã dừng ${doomed.size} tiến trình Codex/MCP con (${roots.length} codex)${alive.length ? `, ép tắt ${alive.length}` : ''}.`);
+}
+
 function cmdSave([nameArg]) {
   const live = readAuth(AUTH);
   if (!live) die(`Không thấy ${AUTH}. Hãy chạy "codex login" trước.`);
@@ -178,10 +221,12 @@ function cmdList() {
   console.log('\n* = đang dùng (khớp ~/.codex/auth.json)');
 }
 
-function cmdUse([nameArg]) {
-  const name = checkName(nameArg);
+async function cmdUse(args) {
+  const { pos, flags } = parseArgs(args);
+  const name = checkName(pos[0]);
   const target = readAuth(accountAuth(name));
   if (!target) die(`Không có tài khoản "${name}". Xem: aiuth list`);
+  await stopCodex(flags);
   const kept = preserveLive();
   writeFile(AUTH, target.raw);
   if (kept) console.log(`• Đã giữ auth hiện tại vào ${kept}`);
@@ -311,7 +356,7 @@ async function cmdExport(args) {
 }
 
 /** Kiểm tra payload giải mã được, lưu thành tài khoản (backup bản cũ nếu ghi đè). */
-function saveImported(plain, flags) {
+async function saveImported(plain, flags) {
   let payload;
   try {
     payload = JSON.parse(plain);
@@ -327,7 +372,7 @@ function saveImported(plain, flags) {
   writeFile(accountAuth(name), payload.auth);
   snapshot(name, payload.auth);
   console.log(`✓ Đã import tài khoản "${name}"${id.email ? ` (${id.email})` : ''}${old ? ' (ghi đè bản cũ, đã backup)' : ''}`);
-  if (flags.use) cmdUse([name]);
+  if (flags.use) await cmdUse([name, ...(flags['no-kill'] ? ['--no-kill'] : [])]);
   else console.log(`  Dùng ngay: aiuth use ${name}`);
 }
 
@@ -348,7 +393,7 @@ async function cmdImport(args) {
   if (!m) die('Chuỗi không đúng định dạng aiuth1:… (có thể bị cắt khi copy).');
   const buf = Buffer.from(m[2], 'base64url');
   const plain = m[1] === 'p' ? buf.toString('utf8') : decrypt(buf, await getPassphrase(false));
-  saveImported(plain, flags);
+  await saveImported(plain, flags);
 }
 
 /* ───────── send / receive: chuyển trực tiếp qua LAN, 1 lần, không qua bên thứ ba ───────── */
@@ -472,16 +517,19 @@ async function cmdReceive(args) {
   if (res.status === 403) die('Sai mã.');
   if (!res.body.blob) die('Không nhận được dữ liệu (máy gửi có thể đã đóng).');
   const plain = decrypt(Buffer.from(res.body.blob, 'base64url'), normCode(codeArg));
-  saveImported(plain, flags);
+  await saveImported(plain, flags);
 }
 
-function cmdRestore([nameArg, idArg = 'latest']) {
-  const name = checkName(nameArg);
+async function cmdRestore(args) {
+  const { pos, flags } = parseArgs(args);
+  const name = checkName(pos[0]);
+  const idArg = pos[1] ?? 'latest';
   if (!fs.existsSync(accountAuth(name))) die(`Không có tài khoản "${name}".`);
   const ids = listBackups(name);
   const id = idArg === 'latest' ? ids.at(-1) : ids.find((x) => x === idArg || x.startsWith(idArg));
   if (!id) die(`Không tìm thấy backup "${idArg}" của "${name}". Xem: aiuth backups ${name}`);
   const bk = readAuth(path.join(accountDir(name), 'backups', `${id}.json`));
+  await stopCodex(flags);
   const kept = preserveLive();
   writeFile(accountAuth(name), bk.raw);
   writeFile(AUTH, bk.raw);
@@ -494,8 +542,11 @@ function cmdRestore([nameArg, idArg = 'latest']) {
  * Giữ auth cũ -> gỡ file auth.json (Codex coi như chưa đăng nhập) -> `codex login --device-auth`
  * -> lưu tài khoản mới. Nếu login thất bại/huỷ thì khôi phục auth cũ.
  */
-function cmdAdd([nameArg]) {
+async function cmdAdd(args) {
+  const { pos, flags } = parseArgs(args);
+  const nameArg = pos[0];
   if (nameArg) checkName(nameArg);
+  await stopCodex(flags);
   const old = readAuth(AUTH);
   if (old) {
     const oldId = identity(old.json);
@@ -554,7 +605,8 @@ const HELP = `aiuth — quản lý nhiều ~/.codex/auth.json
   save [tên]            Lưu auth.json hiện tại thành tài khoản (mặc định tên = email)
   list                  Liệt kê tài khoản (* = đang dùng)
   current               Tài khoản đang dùng
-  use <tên>             Chuyển sang tài khoản (tự giữ auth hiện tại trước khi ghi đè)
+  use <tên>             Chuyển tài khoản: dừng codex + MCP con của nó, giữ auth hiện tại rồi ghi đè
+                        (--no-kill: không dừng codex; áp dụng cho use/restore/add/import --use)
   backup [tên]          Tạo bản backup có dấu thời gian (mặc định: tài khoản đang dùng)
   backups <tên>         Liệt kê backup của tài khoản
   restore <tên> [id]    Khôi phục từ backup (id hoặc tiền tố; mặc định latest)
