@@ -19,7 +19,22 @@ npm i -g aiuth
 | `aiuth backup [tên]` | Backup có dấu thời gian |
 | `aiuth backups <tên>` | Liệt kê backup |
 | `aiuth restore <tên> [id\|latest]` | Khôi phục từ backup |
+| `aiuth export <tên> [id]` | In 1 chuỗi `aiuth1:e:…` (mã hoá bằng passphrase) để dán sang máy khác |
+| `aiuth import [chuỗi]` | Nhập chuỗi từ `export` (`--name`, `--use`) |
+| `aiuth send <tên> [id]` | Chờ 1 máy trong LAN nhận trực tiếp, in lệnh `receive` kèm mã 8 ký tự |
+| `aiuth receive <ip:port> <mã>` | Nhận tài khoản từ máy đang `send` (`--name`, `--use`) |
 | `aiuth remove <tên>` | Xoá tài khoản đã lưu và backup của nó |
+
+## Chuyển sang máy khác
+
+```bash
+# máy A
+aiuth send <tên>                      # in: aiuth receive 192.168.1.5:7421 K7P4-QX9M
+# máy B (cùng mạng / Tailscale / VPN)
+aiuth receive 192.168.1.5:7421 K7P4-QX9M --use
+```
+
+`send` chỉ phục vụ đúng 1 lần, tự đóng sau 5 phút hoặc sau 3 lần sai mã. Dữ liệu mã hoá bằng mã đó, mã không đi qua mạng. Khác mạng thì dùng `export` / `import`.
 
 ## Lưu trữ
 

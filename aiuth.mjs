@@ -11,6 +11,7 @@
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -222,7 +223,7 @@ function parseArgs(args) {
   const flags = {};
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '--name') flags.name = args[++i];
+    if (a === '--name' || a === '--port') flags[a.slice(2)] = args[++i];
     else if (a.startsWith('--')) flags[a.slice(2)] = true;
     else pos.push(a);
   }
@@ -278,24 +279,25 @@ function decrypt(buf, pass) {
   }
 }
 
+/** Lấy nội dung auth của tài khoản: 'main' (mặc định, ưu tiên live nếu cùng tài khoản) hoặc một backup. */
+function pickRaw(name, idArg = 'main') {
+  if (idArg === 'main') {
+    const live = readAuth(AUTH);
+    const saved = readAuth(accountAuth(name));
+    return live && identity(live.json).fingerprint === identity(saved.json).fingerprint ? live.raw : saved.raw;
+  }
+  const ids = listBackups(name);
+  const id = idArg === 'latest' ? ids.at(-1) : ids.find((x) => x === idArg || x.startsWith(idArg));
+  if (!id) die(`Không tìm thấy backup "${idArg}" của "${name}".`);
+  return readAuth(path.join(accountDir(name), 'backups', `${id}.json`)).raw;
+}
+
 /** export <tên> [id|latest] [--no-encrypt]  → in chuỗi ra stdout (thông báo ra stderr). */
 async function cmdExport(args) {
   const { pos, flags } = parseArgs(args);
   const name = checkName(pos[0]);
   if (!fs.existsSync(accountAuth(name))) die(`Không có tài khoản "${name}".`);
-  const idArg = pos[1] ?? 'main';
-  let raw;
-  if (idArg === 'main') {
-    // Ưu tiên auth live nếu thuộc tài khoản này (token mới nhất).
-    const live = readAuth(AUTH);
-    const saved = readAuth(accountAuth(name));
-    raw = live && identity(live.json).fingerprint === identity(saved.json).fingerprint ? live.raw : saved.raw;
-  } else {
-    const ids = listBackups(name);
-    const id = idArg === 'latest' ? ids.at(-1) : ids.find((x) => x === idArg || x.startsWith(idArg));
-    if (!id) die(`Không tìm thấy backup "${idArg}" của "${name}".`);
-    raw = readAuth(path.join(accountDir(name), 'backups', `${id}.json`)).raw;
-  }
+  const raw = pickRaw(name, pos[1]);
   const payload = JSON.stringify({ v: 1, name, exportedAt: new Date().toISOString(), auth: raw });
   let out;
   if (flags['no-encrypt']) {
@@ -306,6 +308,27 @@ async function cmdExport(args) {
   }
   console.error(`✓ Export "${name}" — dán chuỗi dưới đây vào máy khác: aiuth import <chuỗi>`);
   console.log(out);
+}
+
+/** Kiểm tra payload giải mã được, lưu thành tài khoản (backup bản cũ nếu ghi đè). */
+function saveImported(plain, flags) {
+  let payload;
+  try {
+    payload = JSON.parse(plain);
+    JSON.parse(payload.auth);
+  } catch {
+    die('Dữ liệu giải mã không phải auth.json hợp lệ.');
+  }
+  const id = identity(JSON.parse(payload.auth));
+  if (!id.fingerprint) die('auth.json trong chuỗi không có token hay API key.');
+  const name = checkName(flags.name ?? payload.name);
+  const old = readAuth(accountAuth(name));
+  if (old) snapshot(name, old.raw); // giữ bản cũ trước khi ghi đè
+  writeFile(accountAuth(name), payload.auth);
+  snapshot(name, payload.auth);
+  console.log(`✓ Đã import tài khoản "${name}"${id.email ? ` (${id.email})` : ''}${old ? ' (ghi đè bản cũ, đã backup)' : ''}`);
+  if (flags.use) cmdUse([name]);
+  else console.log(`  Dùng ngay: aiuth use ${name}`);
 }
 
 /** import [chuỗi|-] [--name x] [--use]  (không có chuỗi: đọc stdin hoặc hỏi). */
@@ -325,23 +348,131 @@ async function cmdImport(args) {
   if (!m) die('Chuỗi không đúng định dạng aiuth1:… (có thể bị cắt khi copy).');
   const buf = Buffer.from(m[2], 'base64url');
   const plain = m[1] === 'p' ? buf.toString('utf8') : decrypt(buf, await getPassphrase(false));
-  let payload;
-  try {
-    payload = JSON.parse(plain);
-    JSON.parse(payload.auth);
-  } catch {
-    die('Dữ liệu giải mã không phải auth.json hợp lệ.');
-  }
-  const id = identity(JSON.parse(payload.auth));
-  if (!id.fingerprint) die('auth.json trong chuỗi không có token hay API key.');
-  const name = checkName(flags.name ?? payload.name);
-  const old = readAuth(accountAuth(name));
-  if (old) snapshot(name, old.raw); // giữ bản cũ trước khi ghi đè
-  writeFile(accountAuth(name), payload.auth);
-  snapshot(name, payload.auth);
-  console.log(`✓ Đã import tài khoản "${name}"${id.email ? ` (${id.email})` : ''}${old ? ' (ghi đè bản cũ, đã backup)' : ''}`);
-  if (flags.use) cmdUse([name]);
-  else console.log(`  Dùng ngay: aiuth use ${name}`);
+  saveImported(plain, flags);
+}
+
+/* ───────── send / receive: chuyển trực tiếp qua LAN, 1 lần, không qua bên thứ ba ───────── */
+
+const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // bỏ I O 0 1 cho dễ đọc
+const SEND_TTL_MS = 5 * 60 * 1000;
+const MAX_BAD_PROOFS = 3;
+
+const newCode = () => {
+  const c = Array.from({ length: 8 }, () => CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)]).join('');
+  return `${c.slice(0, 4)}-${c.slice(4)}`;
+};
+const normCode = (c) => String(c).toUpperCase().replace(/[^A-Z0-9]/g, '');
+const proofOf = (code, salt) =>
+  crypto.createHmac('sha256', crypto.scryptSync(normCode(code), salt, 32)).update('aiuth-proof').digest('hex');
+
+const lanAddresses = () =>
+  Object.values(os.networkInterfaces())
+    .flat()
+    .filter((i) => i && i.family === 'IPv4' && !i.internal)
+    .map((i) => i.address);
+
+/**
+ * send <tên> [id] [--port N]: mở server HTTP tạm, phục vụ đúng 1 lần.
+ * Máy nhận phải chứng minh biết mã (HMAC) mới nhận được blob; sai quá 3 lần thì đóng.
+ * Blob được mã hoá bằng chính mã đó; mã không bao giờ đi qua mạng.
+ */
+async function cmdSend(args) {
+  const { pos, flags } = parseArgs(args);
+  const name = checkName(pos[0]);
+  if (!fs.existsSync(accountAuth(name))) die(`Không có tài khoản "${name}".`);
+  const code = newCode();
+  const payload = JSON.stringify({ v: 1, name, exportedAt: new Date().toISOString(), auth: pickRaw(name, pos[1]) });
+  const blob = encrypt(payload, normCode(code)).toString('base64url');
+  const salt = crypto.randomBytes(16);
+  const expected = Buffer.from(proofOf(code, salt));
+  let bad = 0;
+
+  const server = http.createServer((req, res) => {
+    const reply = (status, obj) => {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(obj));
+    };
+    if (req.method === 'GET' && req.url === '/hello') return reply(200, { salt: salt.toString('base64url') });
+    if (req.method === 'POST' && req.url === '/fetch') {
+      let body = '';
+      req.on('data', (c) => {
+        body += c;
+        if (body.length > 1024) req.destroy();
+      });
+      req.on('end', () => {
+        let given = '';
+        try {
+          given = String(JSON.parse(body).proof ?? '');
+        } catch {}
+        const got = Buffer.from(given);
+        if (got.length === expected.length && crypto.timingSafeEqual(got, expected)) {
+          reply(200, { blob });
+          console.log('✓ Máy kia đã nhận xong. Đóng server.');
+          setTimeout(() => server.close(() => process.exit(0)), 100);
+        } else {
+          reply(403, { error: 'sai mã' });
+          if (++bad >= MAX_BAD_PROOFS) {
+            console.error(`✗ Sai mã ${MAX_BAD_PROOFS} lần, đóng server.`);
+            setTimeout(() => server.close(() => process.exit(1)), 100);
+          }
+        }
+      });
+      return;
+    }
+    reply(404, { error: 'not found' });
+  });
+
+  server.listen(Number(flags.port) || 0, '0.0.0.0', () => {
+    const { port } = server.address();
+    const ips = lanAddresses();
+    const isTailscale = (ip) => {
+      const [a, b] = ip.split('.').map(Number);
+      return a === 100 && b >= 64 && b <= 127; // CGNAT 100.64.0.0/10 mà Tailscale dùng
+    };
+    const lan = ips.filter((i) => !isTailscale(i));
+    const ts = ips.filter(isTailscale);
+    console.log(`Đang chờ máy nhận (tối đa ${SEND_TTL_MS / 60000} phút, phục vụ đúng 1 lần).\n`);
+    console.log('Chạy 1 trong các lệnh sau trên máy kia:\n');
+    for (const ip of lan) console.log(`  LAN        aiuth receive ${ip}:${port} ${code}`);
+    for (const ip of ts) console.log(`  Tailscale  aiuth receive ${ip}:${port} ${code}`);
+    if (!ts.length) console.log('  (không thấy IP Tailscale — nếu cần, bật Tailscale rồi chạy lại)');
+    if (!ips.length) console.log(`  aiuth receive <ip-máy-này>:${port} ${code}`);
+    console.log('\nCtrl+C để huỷ.');
+  });
+  setTimeout(() => {
+    console.error('✗ Hết thời gian chờ, đóng server.');
+    process.exit(1);
+  }, SEND_TTL_MS).unref();
+  await new Promise(() => {}); // giữ tiến trình sống; thoát qua process.exit ở trên
+}
+
+/** receive <host:port> <mã> [--name x] [--use] */
+async function cmdReceive(args) {
+  const { pos, flags } = parseArgs(args);
+  const [addr, codeArg] = pos;
+  if (!addr || !codeArg) die('Dùng: aiuth receive <host:port> <mã>   (ví dụ: aiuth receive 192.168.1.5:7421 K7P4-QX9M)');
+  if (!/^[A-Za-z0-9.-]+:\d{1,5}$/.test(addr)) die(`Địa chỉ "${addr}" không hợp lệ, cần dạng host:port.`);
+  const base = `http://${addr}`;
+  const call = async (url, init) => {
+    try {
+      const r = await fetch(url, { ...init, signal: AbortSignal.timeout(10_000) });
+      return { status: r.status, body: await r.json().catch(() => ({})) };
+    } catch (e) {
+      die(`Không kết nối được tới ${addr} (${e.cause?.code ?? e.message}). Cùng mạng chưa? Firewall có chặn không?`);
+    }
+  };
+  const hello = await call(`${base}/hello`);
+  if (!hello.body.salt) die('Máy kia không phải aiuth send.');
+  const proof = proofOf(codeArg, Buffer.from(hello.body.salt, 'base64url'));
+  const res = await call(`${base}/fetch`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ proof }),
+  });
+  if (res.status === 403) die('Sai mã.');
+  if (!res.body.blob) die('Không nhận được dữ liệu (máy gửi có thể đã đóng).');
+  const plain = decrypt(Buffer.from(res.body.blob, 'base64url'), normCode(codeArg));
+  saveImported(plain, flags);
 }
 
 function cmdRestore([nameArg, idArg = 'latest']) {
@@ -430,6 +561,8 @@ const HELP = `aiuth — quản lý nhiều ~/.codex/auth.json
   export <tên> [id]     In ra 1 chuỗi (mã hoá bằng passphrase) để import ở máy khác
                         (--no-encrypt: không mã hoá; AIUTH_PASSPHRASE: passphrase qua env)
   import [chuỗi]        Nhập chuỗi từ export (--name <tên> đổi tên, --use dùng ngay)
+  send <tên> [id]       Chờ 1 máy khác trong LAN nhận trực tiếp (in ra lệnh + mã 8 ký tự)
+  receive <ip:port> <mã>  Nhận tài khoản từ máy đang chạy send (--name, --use)
   remove <tên>          Xoá tài khoản đã lưu và backup của nó
 
 Env: CODEX_HOME (mặc định ~/.codex)   Giữ tối đa ${MAX_BACKUPS} backup mỗi tài khoản.`;
@@ -446,6 +579,8 @@ const COMMANDS = {
   backups: cmdBackups,
   export: cmdExport,
   import: cmdImport,
+  send: cmdSend,
+  receive: cmdReceive,
   restore: cmdRestore,
   remove: cmdRemove,
   rm: cmdRemove,
