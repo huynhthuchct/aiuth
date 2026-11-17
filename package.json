@@ -1,0 +1,43 @@
+{
+  "name": "aiuth",
+  "version": "1.0.0",
+  "description": "Quản lý nhiều ~/.codex/auth.json: thêm tài khoản bằng device code, chuyển đổi, backup và restore theo tài khoản",
+  "type": "module",
+  "bin": {
+    "aiuth": "./aiuth.mjs"
+  },
+  "files": [
+    "aiuth.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "codex",
+    "openai",
+    "auth",
+    "account",
+    "switch",
+    "backup",
+    "cli"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "start": "node aiuth.mjs",
+    "list": "node aiuth.mjs list",
+    "check": "node --check aiuth.mjs && node aiuth.mjs help > /dev/null",
+    "prepublishOnly": "npm run check"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/huynhthuchct/aiuth.git"
+  },
+  "homepage": "https://github.com/huynhthuchct/aiuth#readme",
+  "bugs": {
+    "url": "https://github.com/huynhthuchct/aiuth/issues"
+  }
+}
