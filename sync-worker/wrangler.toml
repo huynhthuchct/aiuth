@@ -1,0 +1,8 @@
+name = "aiuth-sync"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "aiuth-sync"
+database_id = "01203641-d0b7-44ee-a8cf-ad1dfa995d59"
