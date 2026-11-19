@@ -2,6 +2,9 @@ node_modules/
 *.tgz
 .DS_Store
 .env
+.wrangler/
+.dev.vars
+setup-info.txt
 # không bao giờ commit token
 auth.json
 accounts/

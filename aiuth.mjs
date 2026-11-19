@@ -17,6 +17,8 @@ import path from 'node:path';
 import readline from 'node:readline';
 import tls from 'node:tls';
 import { spawnSync } from 'node:child_process';
+import { runSync, normalizeSyncUrl, validSyncName, mergeAccounts, changeSyncPassword, resetSyncPassword } from './aiuth-sync.mjs';
+import { setupCloudflare } from './aiuth-setup.mjs';
 
 const HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const AUTH = path.join(HOME, 'auth.json');
@@ -269,7 +271,7 @@ function parseArgs(args) {
   const flags = {};
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === '--name' || a === '--port' || a === '--to' || a === '--wait') flags[a.slice(2)] = args[++i];
+    if (a === '--name' || a === '--port' || a === '--to' || a === '--wait' || a === '--url') flags[a.slice(2)] = args[++i];
     else if (a.startsWith('--')) flags[a.slice(2)] = true;
     else pos.push(a);
   }
@@ -529,14 +531,14 @@ const MAIL_PRESETS = {
 };
 
 /** Hỏi một dòng; hidden=true thì không hiện ký tự. */
-function ask(question, hidden = false) {
+function ask(question, hidden = false, trim = true) {
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stderr, terminal: true });
     if (hidden) rl._writeToOutput = (t) => { if (t.includes(question)) process.stderr.write(t); };
     rl.question(question, (ans) => {
       rl.close();
       if (hidden) process.stderr.write('\n');
-      resolve(ans.trim());
+      resolve(trim ? ans.trim() : ans);
     });
   });
 }
@@ -816,6 +818,87 @@ function cmdRemove([nameArg]) {
   console.log(`Đã xoá tài khoản "${name}" cùng các backup của nó (auth.json live không bị đụng).`);
 }
 
+async function cmdSync(args) {
+  const { pos, flags } = parseArgs(args);
+  const configPath = path.join(HOME, 'aiuth-sync.json');
+  try {
+    for (const flag of Object.keys(flags)) if (!['url', 'confirm-reset'].includes(flag)) throw new Error(`Cờ sync không hợp lệ: --${flag}. Mật khẩu đọc từ terminal hoặc biến môi trường.`);
+    const config = readAuth(configPath)?.json || {};
+    const setup = pos[0] === 'setup';
+    const change = pos[0] === 'change-password';
+    const reset = ['reset-password', 'forgot-password'].includes(pos[0]);
+    if (flags['confirm-reset'] && !reset) throw new Error('--confirm-reset chỉ dùng cho aiuth sync reset-password.');
+    const subcommand = setup || change || reset;
+    if (pos.length > (subcommand ? 2 : 1)) throw new Error('Dùng: aiuth sync [setup|change-password|reset-password] [URL].');
+    if (setup && !flags.url && !pos[1]) {
+      await setupCloudflare({ home: HOME });
+      return;
+    }
+    let url = flags.url || (subcommand ? pos[1] : pos[0]) || process.env.AIUTH_SYNC_URL || config.url;
+    if (!url && process.stdin.isTTY) url = await ask('Địa chỉ Worker aiuth (https://...workers.dev): ');
+    if (!url) throw new Error('Chưa cấu hình Worker. Dùng: aiuth sync setup <URL>');
+    url = normalizeSyncUrl(url);
+    if (setup) {
+      writeFile(configPath, `${JSON.stringify({ url }, null, 2)}\n`);
+      console.log('Đã lưu địa chỉ Worker. Chạy aiuth sync để kéo, gộp và tải dữ liệu lên.');
+      return;
+    }
+    const password = reset ? undefined : process.env.AIUTH_SYNC_PASSWORD ?? (process.stdin.isTTY ? await ask(change ? 'Mật khẩu đồng bộ hiện tại: ' : 'Mật khẩu đồng bộ (ít nhất 8 ký tự): ', true, false) : '');
+    const identify = (auth) => identity(auth).fingerprint;
+    const readLocal = () => {
+      const records = listAccounts().map((name) => ({ name, auth: pickRaw(name) }));
+      const live = readAuth(AUTH);
+      if (live) {
+        const id = identity(live.json);
+        if (!id.fingerprint) throw new Error('auth.json live không có danh tính hợp lệ.');
+        if (!records.some((r) => identify(JSON.parse(r.auth)) === id.fingerprint)) {
+          const name = validSyncName(id.email) ? id.email : `current-${crypto.createHash('sha256').update(id.fingerprint).digest('hex').slice(0, 12)}`;
+          return mergeAccounts(records, [{ name, auth: live.raw }], identify);
+        }
+      }
+      return records;
+    };
+    if (change || reset) {
+      let newPassword = process.env.AIUTH_SYNC_NEW_PASSWORD;
+      if (newPassword === undefined && process.stdin.isTTY) {
+        newPassword = await ask('Mật khẩu đồng bộ mới (ít nhất 8 ký tự): ', true, false);
+        if (newPassword !== await ask('Nhập lại mật khẩu mới: ', true, false)) throw new Error('Hai mật khẩu mới không khớp.');
+      }
+      if (reset) {
+        console.error('Reset sẽ xoá bản đồng bộ cũ trên Worker và thay bằng tài khoản local. Mục chỉ có trên Worker sẽ mất. Auth live và backup local được giữ nguyên.');
+        const confirmed = flags['confirm-reset'] === true || (process.stdin.isTTY && await ask('Nhập RESET để xác nhận: ') === 'RESET');
+        if (!confirmed) throw new Error('Chưa xác nhận reset. Dùng --confirm-reset khi chạy không tương tác.');
+        const setupCode = process.env.AIUTH_SYNC_SETUP_CODE ?? (process.stdin.isTTY ? await ask('Mã thiết lập Worker: ', true) : '');
+        const result = await resetSyncPassword({ url, setupCode, password: newPassword, confirmReset: true, identify, readLocal });
+        console.log(`Đã đặt lại mật khẩu đồng bộ và tải lại ${result.total} tài khoản local lên Worker. Các máy khác cần đăng nhập lại bằng mật khẩu mới.`);
+      } else {
+        await changeSyncPassword({ url, oldPassword: password, password: newPassword });
+        console.log('Đã đổi mật khẩu đồng bộ, giữ nguyên dữ liệu Worker. Các máy khác cần cập nhật aiuth và dùng mật khẩu mới.');
+      }
+      writeFile(configPath, `${JSON.stringify({ url }, null, 2)}\n`);
+      return;
+    }
+    const result = await runSync({
+      url, password, identify, readLocal,
+      setupCode: async () => process.env.AIUTH_SYNC_SETUP_CODE ?? (process.stdin.isTTY ? await ask('Mã thiết lập Worker: ', true) : ''),
+      writeLocal: (records) => {
+        // Tài khoản đã có không bị ghi đè; auth.json live và các backup cũ được giữ nguyên.
+        for (const record of records) {
+          const dir = accountDir(record.name);
+          if (fs.existsSync(dir) && (!fs.lstatSync(dir).isDirectory() || fs.lstatSync(dir).isSymbolicLink())) throw new Error(`Thư mục tài khoản không hợp lệ: ${record.name}`);
+          if (fs.existsSync(accountAuth(record.name))) continue;
+          writeFile(accountAuth(record.name), record.auth);
+          snapshot(record.name, record.auth);
+        }
+      }
+    });
+    writeFile(configPath, `${JSON.stringify({ url }, null, 2)}\n`);
+    console.log(`Đã đồng bộ: local ${result.local}, Worker ${result.remote}, sau khi gộp ${result.total} tài khoản (revision ${result.revision}).`);
+  } catch (e) {
+    die(e.message);
+  }
+}
+
 function cmdCurrent() {
   const live = readAuth(AUTH);
   if (!live) die('Chưa đăng nhập (không có auth.json).');
@@ -837,6 +920,12 @@ const HELP = `aiuth — quản lý nhiều ~/.codex/auth.json
   send <tên> --mail     Gửi qua hộp thư (mã hoá), in mã 12 ký tự; --to <địa-chỉ> gửi tới mail khác
   receive --mail <mã>   Lấy từ hộp thư rồi giải mã (--wait <giây>, --name, --use)
   mail setup            Lưu tài khoản mail (app password) cho send/receive --mail
+  sync setup           Cài Cloudflare: đăng nhập, tạo D1, deploy Worker, lưu mã và URL
+  sync setup <URL>     Chỉ kết nối Worker đã có (không deploy)
+  sync [--url URL]      Kéo Worker → gộp (local ưu tiên) → ghi bản gộp lên Worker và local
+  sync change-password Đổi mật khẩu đồng bộ bằng mật khẩu cũ, giữ dữ liệu Worker
+  sync reset-password  Quên mật khẩu: dùng mã thiết lập, thay Worker bằng bản local (cần xác nhận)
+                        (alias: sync forgot-password; --confirm-reset khi chạy không tương tác)
   receive <ip:port> <mã>  Nhận tài khoản từ máy đang chạy send (--name, --use)
   remove <tên>          Xoá tài khoản đã lưu và backup của nó
 
@@ -853,6 +942,7 @@ const COMMANDS = {
   use: cmdUse,
   send: cmdSend,
   mail: cmdMail,
+  sync: cmdSync,
   receive: cmdReceive,
   remove: cmdRemove,
   rm: cmdRemove,

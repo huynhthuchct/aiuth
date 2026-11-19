@@ -8,6 +8,11 @@
   },
   "files": [
     "aiuth.mjs",
+    "aiuth-sync.mjs",
+    "aiuth-setup.mjs",
+    "sync-worker/src/index.js",
+    "sync-worker/schema.sql",
+    "sync-worker/README.md",
     "README.md"
   ],
   "engines": {
@@ -27,6 +32,7 @@
   },
   "scripts": {
     "start": "node aiuth.mjs",
+    "test": "node --test tests/*.test.mjs",
     "list": "node aiuth.mjs list",
     "check": "node --check aiuth.mjs && node aiuth.mjs help > /dev/null",
     "prepublishOnly": "npm run check"
