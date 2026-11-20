@@ -24,6 +24,11 @@ const HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const AUTH = path.join(HOME, 'auth.json');
 const STORE = path.join(HOME, 'accounts');
 const UNSAVED = path.join(STORE, '.unsaved');
+// Claude Code: token ở <CLAUDE_CONFIG_DIR|~/.claude>/.credentials.json, thông tin tài khoản (email, uuid)
+// ở key oauthAccount trong .claude.json (cạnh thư mục đó nếu mặc định là ~/.claude.json).
+const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+const CLAUDE_CRED = path.join(CLAUDE_DIR, '.credentials.json');
+const CLAUDE_CFG = process.env.CLAUDE_CONFIG_DIR ? path.join(CLAUDE_DIR, '.claude.json') : path.join(os.homedir(), '.claude.json');
 const MAX_BACKUPS = 20;
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._@+-]*$/;
 
@@ -65,8 +70,26 @@ function jwtPayload(token) {
   }
 }
 
+/** Một tài khoản lưu là của Claude nếu có claudeAiOauth, ngược lại là Codex. */
+const providerOf = (json) => (json?.claudeAiOauth ? 'claude' : 'codex');
+
+/** Danh tính của bản lưu Claude: { claudeAiOauth, oauthAccount }. Fingerprint ổn định dù token xoay vòng. */
+function claudeIdentity(json) {
+  const a = json.oauthAccount ?? {};
+  const email = a.emailAddress ?? null;
+  const accountId = a.accountUuid ?? null;
+  return {
+    provider: 'claude',
+    email,
+    accountId,
+    fingerprint: email || accountId ? `claude:${accountId ?? ''}|${email ?? ''}` : null,
+    mode: json.claudeAiOauth.subscriptionType ?? 'oauth',
+  };
+}
+
 /** Trích danh tính (email, account id, fingerprint) từ nội dung auth.json. */
 function identity(json) {
+  if (providerOf(json) === 'claude') return claudeIdentity(json);
   const t = json?.tokens ?? {};
   const claims = jwtPayload(t.id_token);
   const email = claims.email ?? null;
@@ -79,7 +102,41 @@ function identity(json) {
   } else {
     fingerprint = null;
   }
-  return { email, accountId, fingerprint, mode: json?.auth_mode ?? (json?.OPENAI_API_KEY ? 'apikey' : '?') };
+  return { provider: 'codex', email, accountId, fingerprint, mode: json?.auth_mode ?? (json?.OPENAI_API_KEY ? 'apikey' : '?') };
+}
+
+/* ───────── auth live của từng provider ───────── */
+
+const PROVIDERS = ['codex', 'claude'];
+
+/** Đọc auth live. Codex: nguyên auth.json. Claude: gộp credentials + oauthAccount thành 1 bản lưu. */
+function readLive(provider) {
+  if (provider === 'codex') return readAuth(AUTH);
+  const cred = readAuth(CLAUDE_CRED)?.json;
+  if (!cred?.claudeAiOauth) return null;
+  const oauthAccount = readAuth(CLAUDE_CFG)?.json?.oauthAccount;
+  const json = { claudeAiOauth: cred.claudeAiOauth, ...(oauthAccount ? { oauthAccount } : {}) };
+  return { raw: `${JSON.stringify(json, null, 2)}\n`, json };
+}
+
+/** Ghi bản lưu thành auth live. Claude: chỉ thay claudeAiOauth và oauthAccount, giữ nguyên các key khác. */
+function writeLive(provider, raw) {
+  if (provider === 'codex') return writeFile(AUTH, raw);
+  const saved = JSON.parse(raw);
+  const cred = readAuth(CLAUDE_CRED)?.json ?? {};
+  cred.claudeAiOauth = saved.claudeAiOauth;
+  const cfg = readAuth(CLAUDE_CFG)?.json ?? {};
+  if (saved.oauthAccount) cfg.oauthAccount = saved.oauthAccount;
+  else delete cfg.oauthAccount;
+  writeFile(CLAUDE_CRED, `${JSON.stringify(cred, null, 2)}\n`);
+  writeFile(CLAUDE_CFG, `${JSON.stringify(cfg, null, 2)}\n`);
+}
+
+/** Tên mặc định cho tài khoản mới: email; nếu đã bị tài khoản khác (provider kia) chiếm thì thêm hậu tố provider. */
+function defaultName(id, taken = new Set(listAccounts())) {
+  const base = id.email;
+  if (!base) return null;
+  return taken.has(base) ? `${base}-${id.provider}` : base;
 }
 
 const checkName = (name) => {
@@ -150,8 +207,8 @@ function findAccountFor(fingerprint) {
 }
 
 /** Trước khi ghi đè auth live: đồng bộ vào tài khoản của nó + backup, hoặc cất vào .unsaved. */
-function preserveLive() {
-  const live = readAuth(AUTH);
+function preserveLive(provider) {
+  const live = readLive(provider);
   if (!live) return null;
   const owner = findAccountFor(identity(live.json).fingerprint);
   if (owner) {
@@ -159,7 +216,7 @@ function preserveLive() {
     snapshot(owner, live.raw);
     return `tài khoản "${owner}"`;
   }
-  writeFile(path.join(UNSAVED, `${stamp()}.json`), live.raw);
+  writeFile(path.join(UNSAVED, `${provider}-${stamp()}.json`), live.raw);
   return `${path.relative(HOME, UNSAVED)}/`;
 }
 
@@ -208,28 +265,49 @@ async function stopCodex(flags = {}) {
   console.log(`Đã dừng ${doomed.size} tiến trình Codex/MCP con (${roots.length} codex)${alive.length ? `, ép tắt ${alive.length}` : ''}.`);
 }
 
-function cmdSave([nameArg]) {
-  const live = readAuth(AUTH);
-  if (!live) die(`Không thấy ${AUTH}. Hãy chạy "codex login" trước.`);
+/** Lưu auth live của một provider (đã biết là có đăng nhập). Trả về true nếu đã lưu. */
+function saveProvider(provider, nameArg) {
+  const live = readLive(provider);
   const id = identity(live.json);
-  const name = checkName(nameArg ?? id.email);
-  if (!nameArg && !id.email) die('Không đọc được email từ auth.json, hãy truyền tên: save <tên>');
+  if (!id.fingerprint && provider === 'claude') {
+    console.log(`Bỏ qua Claude: không đọc được tài khoản từ ${CLAUDE_CFG} (thiếu oauthAccount).`);
+    return false;
+  }
+  // Không truyền tên: ưu tiên tài khoản đã lưu của chính danh tính này, rồi mới tới email.
+  const name = checkName(nameArg ?? findAccountFor(id.fingerprint) ?? defaultName(id) ?? null);
   const existed = fs.existsSync(accountAuth(name));
+  if (existed && identity(readAuth(accountAuth(name)).json).provider !== provider) {
+    die(`Tên "${name}" đang là tài khoản ${identity(readAuth(accountAuth(name)).json).provider}. Chọn tên khác: save <tên>`);
+  }
   writeFile(accountAuth(name), live.raw);
   snapshot(name, live.raw);
-  console.log(`${existed ? 'Cập nhật' : 'Đã lưu'} tài khoản "${name}"${id.email ? ` (${id.email})` : ''}`);
+  console.log(`${existed ? 'Cập nhật' : 'Đã lưu'} tài khoản ${provider} "${name}"${id.email ? ` (${id.email})` : ''}`);
+  return true;
+}
+
+/**
+ * save [tên]: lưu cả Codex và Claude đang đăng nhập. Có tên mà cả hai cùng có: Codex lấy "tên",
+ * Claude lấy "tên-claude".
+ */
+function cmdSave([nameArg]) {
+  const present = PROVIDERS.filter((p) => readLive(p));
+  if (!present.length) die('Chưa đăng nhập Codex lẫn Claude. Hãy chạy "codex login" hoặc "claude" (/login) trước.');
+  for (const p of present) {
+    const name = nameArg && present.length > 1 && p === 'claude' ? `${nameArg}-claude` : nameArg;
+    saveProvider(p, name);
+  }
 }
 
 async function cmdList(args = []) {
   const { flags } = parseArgs(args);
   const names = listAccounts();
   if (!names.length) return console.log('Chưa có tài khoản nào. Dùng: aiuth save [tên]');
-  const live = readAuth(AUTH);
-  const liveFp = live ? identity(live.json).fingerprint : null;
+  const lives = Object.fromEntries(PROVIDERS.map((p) => [p, readLive(p)]));
   const rows = names.map((n) => {
     const saved = readAuth(accountAuth(n));
     const id = identity(saved.json);
-    const active = !!liveFp && id.fingerprint === liveFp;
+    const live = lives[id.provider];
+    const active = !!live && !!id.fingerprint && identity(live.json).fingerprint === id.fingerprint;
     return { n, id, active, raw: active ? live.raw : saved.raw };
   });
   // --usage: gọi song song, mỗi tài khoản một dòng tóm tắt limit.
@@ -242,13 +320,13 @@ async function cmdList(args = []) {
       .join(' · ');
     return `${u.data.rate_limit?.limit_reached ? 'CHẠM LIMIT ' : ''}${txt || '-'}`;
   };
-  console.log(`  ${'#'.padStart(2)} ${'TÊN'.padEnd(32)} ${'EMAIL'.padEnd(32)} ${'MODE'.padEnd(9)} ${'BACKUPS'.padEnd(7)}${flags.usage ? ' LIMIT' : ''}`);
+  console.log(`  ${'#'.padStart(2)} ${'PROVIDER'.padEnd(8)} ${'TÊN'.padEnd(32)} ${'EMAIL'.padEnd(32)} ${'MODE'.padEnd(9)} ${'BACKUPS'.padEnd(7)}${flags.usage ? ' LIMIT' : ''}`);
   rows.forEach((r, i) => {
     console.log(
-      `${r.active ? '*' : ' '} ${String(i + 1).padStart(2)} ${r.n.padEnd(32)} ${(r.id.email ?? '-').padEnd(32)} ${r.id.mode.padEnd(9)} ${String(listBackups(r.n).length).padEnd(7)}${flags.usage ? ` ${summary(limits[i])}` : ''}`,
+      `${r.active ? '*' : ' '} ${String(i + 1).padStart(2)} ${r.id.provider.padEnd(8)} ${r.n.padEnd(32)} ${(r.id.email ?? '-').padEnd(32)} ${r.id.mode.padEnd(9)} ${String(listBackups(r.n).length).padEnd(7)}${flags.usage ? ` ${summary(limits[i])}` : ''}`,
     );
   });
-  console.log(`\n* = đang dùng (khớp ~/.codex/auth.json)${flags.usage ? '' : '   |   thêm --usage để xem limit   |   dùng: aiuth use <số hoặc tên>'}`);
+  console.log(`\n* = đang dùng (khớp auth live của provider đó)${flags.usage ? '' : '   |   thêm --usage để xem limit   |   dùng: aiuth use <số hoặc tên>'}`);
 }
 
 async function cmdUse(args) {
@@ -256,11 +334,13 @@ async function cmdUse(args) {
   const name = resolveName(pos[0]);
   const target = readAuth(accountAuth(name));
   if (!target) die(`Không có tài khoản "${name}". Xem: aiuth list`);
-  await stopCodex(flags);
-  const kept = preserveLive();
-  writeFile(AUTH, target.raw);
-  if (kept) console.log(`Đã giữ auth hiện tại vào ${kept}`);
-  console.log(`Đang dùng "${name}"${identity(target.json).email ? ` (${identity(target.json).email})` : ''}`);
+  const id = identity(target.json);
+  if (id.provider === 'codex') await stopCodex(flags);
+  const kept = preserveLive(id.provider);
+  writeLive(id.provider, target.raw);
+  if (kept) console.log(`Đã giữ auth ${id.provider} hiện tại vào ${kept}`);
+  console.log(`Đang dùng ${id.provider} "${name}"${id.email ? ` (${id.email})` : ''}`);
+  if (id.provider === 'claude') console.log('Hãy khởi động lại Claude Code (bản đang mở giữ token cũ trong bộ nhớ).');
 }
 
 /* ───────── helper dùng chung cho send / receive ───────── */
@@ -304,8 +384,8 @@ function decrypt(buf, pass) {
 /** Lấy nội dung auth của tài khoản: 'main' (mặc định, ưu tiên live nếu cùng tài khoản) hoặc một backup. */
 function pickRaw(name, idArg = 'main') {
   if (idArg === 'main') {
-    const live = readAuth(AUTH);
     const saved = readAuth(accountAuth(name));
+    const live = readLive(providerOf(saved.json));
     return live && identity(live.json).fingerprint === identity(saved.json).fingerprint ? live.raw : saved.raw;
   }
   const ids = listBackups(name);
@@ -484,6 +564,7 @@ const leftOf = (used) => Math.max(0, Math.min(100, 100 - used));
 /** Gọi endpoint usage của Codex bằng token đã lưu. Không refresh token (tránh xoay vòng làm hỏng máy khác). */
 async function fetchUsage(raw) {
   const json = JSON.parse(raw);
+  if (providerOf(json) === 'claude') return { error: 'Claude: chưa hỗ trợ thống kê limit' };
   const t = json.tokens;
   if (!t?.access_token) return { error: 'tài khoản API key: không có thống kê limit' };
   const headers = { Authorization: `Bearer ${t.access_token}`, 'User-Agent': 'aiuth' };
@@ -723,15 +804,13 @@ async function cmdUsage(args) {
   const names = pos[0] ? [resolveName(pos[0])] : listAccounts();
   if (!names.length) return console.log('Chưa có tài khoản nào. Dùng: aiuth save [tên]');
   for (const n of names) if (!fs.existsSync(accountAuth(n))) die(`Không có tài khoản "${n}".`);
-  const live = readAuth(AUTH);
-  const liveFp = live ? identity(live.json).fingerprint : null;
-
   const all = listAccounts();
   const results = await Promise.all(
     names.map(async (n) => {
       const saved = readAuth(accountAuth(n));
       // Auth live của cùng tài khoản thường mới hơn bản đã lưu (Codex tự refresh token).
-      const useLive = live && identity(saved.json).fingerprint === liveFp;
+      const live = readLive(providerOf(saved.json));
+      const useLive = live && identity(saved.json).fingerprint === identity(live.json).fingerprint;
       const res = await fetchUsage(useLive ? live.raw : saved.raw);
       return { name: n, active: useLive, email: identity(saved.json).email, ...res };
     }),
@@ -769,7 +848,7 @@ async function cmdUsage(args) {
  * Giữ auth cũ -> gỡ file auth.json (Codex coi như chưa đăng nhập) -> `codex login --device-auth`
  * -> lưu tài khoản mới. Nếu login thất bại/huỷ thì khôi phục auth cũ.
  */
-async function cmdAdd(args) {
+async function cmdAdd(args) { // chỉ Codex; Claude: chạy "claude" rồi /login, sau đó "aiuth save"
   const { pos, flags } = parseArgs(args);
   const nameArg = pos[0];
   if (nameArg) checkName(nameArg);
@@ -846,14 +925,19 @@ async function cmdSync(args) {
     const password = reset ? undefined : process.env.AIUTH_SYNC_PASSWORD ?? (process.stdin.isTTY ? await ask(change ? 'Mật khẩu đồng bộ hiện tại: ' : 'Mật khẩu đồng bộ (ít nhất 8 ký tự): ', true, false) : '');
     const identify = (auth) => identity(auth).fingerprint;
     const readLocal = () => {
-      const records = listAccounts().map((name) => ({ name, auth: pickRaw(name) }));
-      const live = readAuth(AUTH);
-      if (live) {
+      let records = listAccounts().map((name) => ({ name, auth: pickRaw(name) }));
+      for (const provider of PROVIDERS) {
+        const live = readLive(provider);
+        if (!live) continue;
         const id = identity(live.json);
-        if (!id.fingerprint) throw new Error('auth.json live không có danh tính hợp lệ.');
+        if (!id.fingerprint) {
+          if (provider === 'claude') continue; // chưa đọc được tài khoản Claude: bỏ qua, không chặn sync
+          throw new Error('auth.json live không có danh tính hợp lệ.');
+        }
         if (!records.some((r) => identify(JSON.parse(r.auth)) === id.fingerprint)) {
-          const name = validSyncName(id.email) ? id.email : `current-${crypto.createHash('sha256').update(id.fingerprint).digest('hex').slice(0, 12)}`;
-          return mergeAccounts(records, [{ name, auth: live.raw }], identify);
+          const email = defaultName(id, new Set(records.map((r) => r.name)));
+          const name = validSyncName(email) ? email : `current-${crypto.createHash('sha256').update(id.fingerprint).digest('hex').slice(0, 12)}`;
+          records = mergeAccounts(records, [{ name, auth: live.raw }], identify);
         }
       }
       return records;
@@ -900,21 +984,24 @@ async function cmdSync(args) {
 }
 
 function cmdCurrent() {
-  const live = readAuth(AUTH);
-  if (!live) die('Chưa đăng nhập (không có auth.json).');
-  const id = identity(live.json);
-  const owner = findAccountFor(id.fingerprint);
-  console.log(`${owner ?? '(chưa lưu)'}  ${id.email ?? '-'}  [${id.mode}]`);
+  const present = PROVIDERS.map((p) => [p, readLive(p)]).filter(([, live]) => live);
+  if (!present.length) die('Chưa đăng nhập Codex lẫn Claude.');
+  for (const [p, live] of present) {
+    const id = identity(live.json);
+    console.log(`${p.padEnd(7)} ${findAccountFor(id.fingerprint) ?? '(chưa lưu)'}  ${id.email ?? '-'}  [${id.mode}]`);
+  }
 }
 
-const HELP = `aiuth — quản lý nhiều ~/.codex/auth.json
+const HELP = `aiuth — quản lý nhiều tài khoản Codex (~/.codex/auth.json) và Claude Code (~/.claude/.credentials.json)
 
-  add [tên]             Thêm tài khoản mới bằng device code, KHÔNG logout tài khoản cũ
-  save [tên]            Lưu auth.json hiện tại thành tài khoản (mặc định tên = email)
-  list [--usage]        Liệt kê tài khoản (* = đang dùng); --usage thêm cột limit
+  add [tên]             Thêm tài khoản Codex mới bằng device code, KHÔNG logout tài khoản cũ
+                        (Claude: chạy "claude" rồi /login, sau đó "aiuth save")
+  save [tên]            Lưu cả Codex và Claude đang đăng nhập (mặc định tên = email)
+  list [--usage]        Liệt kê tài khoản Codex + Claude (* = đang dùng); --usage thêm cột limit (chỉ Codex)
   current               Tài khoản đang dùng
   usage [số|tên] [--json]  Thống kê limit (% đã dùng, thời gian reset) của từng tài khoản
-  use <số|tên>          Chuyển tài khoản (số thứ tự theo list): dừng codex + MCP con của nó, giữ auth hiện tại rồi ghi đè
+  use <số|tên>          Chuyển tài khoản (số thứ tự theo list), chỉ đổi provider của tài khoản đó.
+                        Codex: dừng codex + MCP con, giữ auth hiện tại rồi ghi đè. Claude: khởi động lại Claude Code sau khi use
                         (--no-kill: không dừng codex; áp dụng cho use/add/receive --use)
   send <tên>            Chờ 1 máy khác trong LAN nhận trực tiếp (in ra lệnh + mã 8 ký tự)
   send <tên> --mail     Gửi qua hộp thư (mã hoá), in mã 12 ký tự; --to <địa-chỉ> gửi tới mail khác
@@ -929,7 +1016,7 @@ const HELP = `aiuth — quản lý nhiều ~/.codex/auth.json
   receive <ip:port> <mã>  Nhận tài khoản từ máy đang chạy send (--name, --use)
   remove <tên>          Xoá tài khoản đã lưu và backup của nó
 
-Env: CODEX_HOME (mặc định ~/.codex)   Giữ tối đa ${MAX_BACKUPS} backup mỗi tài khoản.`;
+Env: CODEX_HOME (mặc định ~/.codex), CLAUDE_CONFIG_DIR (mặc định ~/.claude)   Giữ tối đa ${MAX_BACKUPS} backup mỗi tài khoản.`;
 
 const COMMANDS = {
   add: cmdAdd,

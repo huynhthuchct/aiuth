@@ -1,7 +1,7 @@
 {
   "name": "aiuth",
   "version": "1.0.0",
-  "description": "Quản lý nhiều ~/.codex/auth.json: thêm tài khoản bằng device code, chuyển đổi, backup và restore theo tài khoản",
+  "description": "Quản lý nhiều tài khoản Codex và Claude Code (~/.codex/auth.json, ~/.claude/.credentials.json): thêm tài khoản bằng device code, chuyển đổi, backup và restore theo tài khoản",
   "type": "module",
   "bin": {
     "aiuth": "./aiuth.mjs"

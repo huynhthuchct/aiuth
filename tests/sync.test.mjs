@@ -201,7 +201,7 @@ test('CLI sync keeps live auth and backups, imports Worker records and prefers r
     fs.writeFileSync(path.join(dir, 'accounts', 'local', 'auth.json'), stored.auth);
     fs.writeFileSync(path.join(dir, 'accounts', 'local', 'backups', 'old.json'), stored.auth);
     fs.writeFileSync(path.join(dir, 'auth.json'), live.auth);
-    const env = { CODEX_HOME: dir, AIUTH_SYNC_PASSWORD: 'test-password', AIUTH_SYNC_URL: url, AIUTH_SYNC_SETUP_CODE: '' };
+    const env = { CODEX_HOME: dir, CLAUDE_CONFIG_DIR: path.join(dir, 'claude-empty'), AIUTH_SYNC_PASSWORD: 'test-password', AIUTH_SYNC_URL: url, AIUTH_SYNC_SETUP_CODE: '' };
     const result = await runCli(['sync'], env);
     assert.equal(result.code, 0, result.stderr);
     assert.equal(fs.readFileSync(path.join(dir, 'auth.json'), 'utf8'), live.auth);

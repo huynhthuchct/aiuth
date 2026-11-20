@@ -1,6 +1,6 @@
 # aiuth
 
-Quản lý nhiều tài khoản cho `~/.codex/auth.json` của Codex CLI. Không phụ thuộc thư viện, cần Node >= 18.
+Quản lý nhiều tài khoản cho Codex CLI (`~/.codex/auth.json`) và Claude Code (`~/.claude/.credentials.json`) trong **một danh sách chung**. Không phụ thuộc thư viện, cần Node >= 18.
 
 ```bash
 npm i -g aiuth
@@ -11,12 +11,12 @@ npm i -g aiuth
 
 | Lệnh | Tác dụng |
 |---|---|
-| `aiuth add [tên]` | Thêm tài khoản mới bằng `codex login --device-auth`, **không logout** tài khoản cũ |
-| `aiuth save [tên]` | Lưu auth hiện tại thành tài khoản (mặc định tên = email) |
-| `aiuth list [--usage]` | Liệt kê tài khoản, `*` = đang dùng |
-| `aiuth current` | Tài khoản đang dùng |
+| `aiuth add [tên]` | Thêm tài khoản Codex mới bằng `codex login --device-auth`, **không logout** tài khoản cũ (Claude: chạy `claude` rồi `/login`, sau đó `aiuth save`) |
+| `aiuth save [tên]` | Lưu **cả Codex và Claude** đang đăng nhập (mặc định tên = email; có tên mà cả hai cùng có thì Claude là `<tên>-claude`) |
+| `aiuth list [--usage]` | Liệt kê tài khoản Codex + Claude (cột `PROVIDER`), `*` = đang dùng. `--usage` chỉ có số liệu cho Codex |
+| `aiuth current` | Tài khoản đang dùng của từng provider |
 | `aiuth usage [tên]` | Thống kê limit từng tài khoản: % đã dùng, thời gian reset, credits (`--json`) |
-| `aiuth use <số\|tên>` | Chuyển tài khoản (tự giữ auth hiện tại trước khi ghi đè) |
+| `aiuth use <số\|tên>` | Chuyển tài khoản, **chỉ đổi provider của dòng đó** (use dòng Claude thì Codex giữ nguyên và ngược lại). Tự giữ auth hiện tại trước khi ghi đè. Sau khi đổi Claude, hãy khởi động lại Claude Code |
 | `aiuth send <tên>` | Chờ 1 máy trong LAN nhận trực tiếp, in lệnh `receive` kèm mã 8 ký tự |
 | `aiuth receive <ip:port> <mã>` | Nhận tài khoản từ máy đang `send` (`--name`, `--use`) |
 | `aiuth remove <tên>` | Xoá tài khoản đã lưu và backup của nó |
@@ -93,12 +93,13 @@ Dữ liệu mã hoá bằng mã 12 ký tự trước khi gửi; mã không nằm
 
 ```
 ~/.codex/auth.json                     file live Codex đọc
-~/.codex/accounts/<tên>/auth.json      bản mới nhất của tài khoản
+~/.claude/.credentials.json            token live Claude Code (+ oauthAccount trong ~/.claude.json)
+~/.codex/accounts/<tên>/auth.json      bản mới nhất của tài khoản (Codex hoặc Claude, nhận biết theo nội dung)
 ~/.codex/accounts/<tên>/backups/*.json tối đa 20 bản
 ~/.codex/accounts/.unsaved/*.json      auth bị ghi đè mà chưa thuộc tài khoản nào
 ```
 
-Đổi thư mục bằng biến môi trường `CODEX_HOME`. File được ghi với quyền `0600`.
+Đổi thư mục bằng biến môi trường `CODEX_HOME` (Codex và kho tài khoản) và `CLAUDE_CONFIG_DIR` (Claude Code). Claude chỉ hỗ trợ dạng file (Windows/Linux); macOS Keychain chưa hỗ trợ. Khi `use` tài khoản Claude, chỉ `claudeAiOauth` và `oauthAccount` bị thay, các key khác giữ nguyên. File được ghi với quyền `0600`.
 
 ## Lưu ý bảo mật
 
